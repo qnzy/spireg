@@ -1,0 +1,14 @@
+reg_name,field_name,lsb,msb,type,reset
+CONTROL,enable,0,0,rw,0x0
+,mode,1,2,rw,0x0
+,reserved,3,7,rw,0x0
+STATUS,ready,0,0,ro,0x0
+,error,1,1,ro,0x0
+,busy,2,2,ro,0x0
+,reserved,3,7,ro,0x0
+DATA_IN,data,0,7,rw,0x00
+DATA_OUT,data,0,7,ro,0x00
+CONFIG,threshold,0,3,rw,0x5
+,gain,4,6,rw,0x3
+,invert,7,7,rw,0x0
+ID,chip_id,0,7,ro,0xA5

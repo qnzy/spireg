@@ -1,0 +1,4 @@
+test/*.vcd
+test/*.out
+test/*generated*.v
+
