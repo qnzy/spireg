@@ -18,9 +18,6 @@ CSV format:
 - type can be rw (read/write) or ro (read only)
 - rw creates output from the regmap, ro generate input to the regmap
 
-Note that potentially trailing commas could be generated. 
-Needs manual fix at the moment.
-
 Public domain / CCO
 """
 
@@ -139,18 +136,6 @@ def generate_verilog(registers, output_file):
     v.append("`timescale 1ns / 1ps")
     v.append("")
 
-    # Module declaration
-    v.append("module spi_reg_interface (")
-    v.append("    // SPI interface")
-    v.append("    input  wire       sclk,")
-    v.append("    input  wire       mosi,")
-    v.append("    output reg        miso,")
-    v.append("    input  wire       cs_n,")
-    v.append("    ")
-    v.append("    // System reset")
-    v.append("    input  wire       rst_n,")
-    v.append("    ")
-
     # Collect all RO and RW fields
     ro_fields = []
     rw_fields = []
@@ -163,29 +148,47 @@ def generate_verilog(registers, output_file):
             else:
                 rw_fields.append(field)
 
-    # RO field inputs
+    # Module declaration (build port list first to avoid trailing comma bugs)
+    port_items = []  # each item: ("port"|"comment"|"blank", text)
+    port_items.append(("comment", "    // SPI interface"))
+    port_items.append(("port",    "    input  wire       sclk"))
+    port_items.append(("port",    "    input  wire       mosi"))
+    port_items.append(("port",    "    output reg        miso"))
+    port_items.append(("port",    "    input  wire       cs_n"))
+    port_items.append(("blank",   "    "))
+    port_items.append(("comment", "    // System reset"))
+    port_items.append(("port",    "    input  wire       rst_n"))
+
     if ro_fields:
-        v.append("    // Read-only field inputs")
+        port_items.append(("blank",   "    "))
+        port_items.append(("comment", "    // Read-only field inputs"))
         for field in ro_fields:
             signal_name = f"{field['reg_name']}_{field['name']}_i"
             if field["width"] == 1:
-                v.append(f"    input  wire       {signal_name},")
+                port_items.append(("port", f"    input  wire       {signal_name}"))
             else:
-                v.append(f"    input  wire [{field['width']-1}:0] {signal_name},")
-        v.append("    ")
+                port_items.append(("port", f"    input  wire [{field['width']-1}:0] {signal_name}"))
 
-    # RW field outputs
     if rw_fields:
-        v.append("    // Read-write field outputs")
-        for i, field in enumerate(rw_fields):
-            comma = "" if i == len(rw_fields) - 1 else ","
+        port_items.append(("blank",   "    "))
+        port_items.append(("comment", "    // Read-write field outputs"))
+        for field in rw_fields:
             signal_name = f"{field['reg_name']}_{field['name']}_o"
             if field["width"] == 1:
-                v.append(f"    output wire       {signal_name}{comma}")
+                port_items.append(("port", f"    output wire       {signal_name}"))
             else:
-                v.append(f"    output wire [{field['width']-1}:0] {signal_name}{comma}")
+                port_items.append(("port", f"    output wire [{field['width']-1}:0] {signal_name}"))
 
+    v.append("module spi_reg_interface (")
+    # Add commas to all port lines except the last one
+    last_port_idx = max(i for i, (k, _) in enumerate(port_items) if k == "port")
+    for i, (kind, line) in enumerate(port_items):
+        if kind == "port":
+            v.append(line + ("," if i != last_port_idx else ""))
+        else:
+            v.append(line)
     v.append(");")
+    v.append("")
     v.append("")
 
     # Register declarations
