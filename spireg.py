@@ -2,6 +2,7 @@
 """
 SPI Register Interface Generator
 Generates Verilog-2005 compatible SPI slave + register file from CSV specification
+The SPI and the registers are directly clocked with SCLK, no other clock is required.
 
 This script has been generated using an LLM.
 
