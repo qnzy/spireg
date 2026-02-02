@@ -4,8 +4,6 @@ SPI Register Interface Generator
 Generates Verilog-2005 compatible SPI slave + register file from CSV specification
 The SPI and the registers are directly clocked with SCLK, no other clock is required.
 
-This script has been generated using an LLM and refined through code review.
-
 SPI protocol:
 - Byte 0: RW bit (1) + 7-bit address
 - Byte 1+: 8-bit data (write data or dummy for read)
@@ -15,21 +13,12 @@ SPI protocol:
 - Maximum transfer: 128 bytes (1 command + 127 data bytes)
 - Mode 0: CPOL=0, CPHA=0
 
-Features:
-- 10-bit bit_count: supports up to 128-byte transfers
-- Address saturation: safe behavior when exceeding address space
-- Single procedural driver: synthesizable design (addr/byte_count owned by receive block)
-- Mixed RO/RW registers: bit-level write masking
-- Undefined register addresses: safely ignored
-
 CSV format:
 - First line must contain (in any order): reg_name,field_name,lsb,msb,type,reset
 - Following lines define register fields.
 - reg_name can be empty to reuse from previous line.
 - type can be rw (read/write) or ro (read only)
 - rw creates output from the regmap, ro generate input to the regmap
-
-Public domain / CC0
 """
 
 import csv
