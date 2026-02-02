@@ -240,6 +240,54 @@ def generate_verilog(registers, output_file):
             v.append(f"    reg [7:0] {reg['name']}_reg;")
     v.append("")
 
+    # Add 2-FF synchronizers for all RO inputs (CDC protection)
+    if ro_fields:
+        v.append("    //========================================================================")
+        v.append("    // 2-FF Synchronizers for RO inputs (CDC protection)")
+        v.append("    // Prevents metastability from async inputs propagating to MISO output")
+        v.append("    //========================================================================")
+        v.append("    ")
+        
+        # Declare sync registers
+        for field in ro_fields:
+            signal_name = f"{field['reg_name']}_{field['name']}"
+            if field["width"] == 1:
+                v.append(f"    reg {signal_name}_sync1, {signal_name}_sync2;")
+            else:
+                v.append(f"    reg [{field['width']-1}:0] {signal_name}_sync1, {signal_name}_sync2;")
+        
+        v.append("")
+        v.append("    // Synchronizer logic: input → sync1 → sync2")
+        v.append("    always @(posedge sclk or negedge rst_n) begin")
+        v.append("        if (!rst_n) begin")
+        
+        # Reset sync registers
+        for field in ro_fields:
+            signal_name = f"{field['reg_name']}_{field['name']}"
+            if field["width"] == 1:
+                v.append(f"            {signal_name}_sync1 <= 1'b0;")
+                v.append(f"            {signal_name}_sync2 <= 1'b0;")
+            else:
+                v.append(f"            {signal_name}_sync1 <= {field['width']}'d0;")
+                v.append(f"            {signal_name}_sync2 <= {field['width']}'d0;")
+        
+        v.append("        end")
+        v.append("        else begin")
+        v.append("            // First stage")
+        for field in ro_fields:
+            signal_name = f"{field['reg_name']}_{field['name']}"
+            v.append(f"            {signal_name}_sync1 <= {signal_name}_i;")
+        
+        v.append("            // Second stage (output)")
+        for field in ro_fields:
+            signal_name = f"{field['reg_name']}_{field['name']}"
+            v.append(f"            {signal_name}_sync2 <= {signal_name}_sync1;")
+        
+        v.append("        end")
+        v.append("    end")
+        v.append("")
+
+
     # Combinational read mux (read_byte) - FIXED FOR MIXED FIELDS
     v.append("    //========================================================================")
     v.append("    // Read mux (combinational) -> read_byte")
@@ -261,8 +309,8 @@ def generate_verilog(registers, output_file):
                 for bit in range(field["lsb"], field["msb"] + 1):
                     bit_sources[7 - bit] = f"{reg['name']}_reg[{bit}]"
             else:
-                # RO field comes from input port
-                sig = f"{reg['name']}_{field['name']}_i"
+                # RO field comes from synchronized input (CDC-safe)
+                sig = f"{reg['name']}_{field['name']}_sync2"
                 for bit in range(field["lsb"], field["msb"] + 1):
                     if field["width"] == 1:
                         bit_sources[7 - bit] = sig
