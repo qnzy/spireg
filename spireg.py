@@ -4,23 +4,14 @@ SPI Register Interface Generator
 Generates Verilog-2005 compatible SPI slave + register file from CSV specification
 The SPI and the registers are directly clocked with SCLK, no other clock is required.
 
-This script has been generated using an LLM and refined through code review.
+This script has been generated using an LLM.
 
 SPI protocol:
 - Byte 0: RW bit (1) + 7-bit address
 - Byte 1+: 8-bit data (write data or dummy for read)
 - rw: 1 for write, 0 for read
 - Multi-byte transfers: address auto-increments after each data byte
-- Address saturates at 0x7F (does NOT wrap to 0x00)
-- Maximum transfer: 128 bytes (1 command + 127 data bytes)
-- Mode 0: CPOL=0, CPHA=0
-
-Features:
-- 10-bit bit_count: supports up to 128-byte transfers
-- Address saturation: safe behavior when exceeding address space
-- Single procedural driver: synthesizable design (addr/byte_count owned by receive block)
-- Mixed RO/RW registers: bit-level write masking
-- Undefined register addresses: safely ignored
+- Address wraps at register file boundary (0x7F -> 0x00)
 
 CSV format:
 - First line must contain (in any order): reg_name,field_name,lsb,msb,type,reset
@@ -29,7 +20,7 @@ CSV format:
 - type can be rw (read/write) or ro (read only)
 - rw creates output from the regmap, ro generate input to the regmap
 
-Public domain / CC0
+Public domain / CCO
 """
 
 import csv
@@ -124,14 +115,7 @@ def _parse_reset_to_int(reset_str: str) -> int:
 
 
 def generate_verilog(registers, output_file):
-    """
-    Generate complete SPI register interface with the following features:
-    - 10-bit bit_count: supports up to 128-byte transfers
-    - Address saturation: stops at 0x7F (no wrap to 0x00)
-    - Single procedural driver: addr/byte_count owned by receive block only
-    - Mode 0 (CPOL=0, CPHA=0)
-    - Mixed RO/RW register support with bit-level masking
-    """
+    """Generate complete SPI register interface"""
 
     addr_width = 7
     data_width = 8
@@ -231,6 +215,7 @@ def generate_verilog(registers, output_file):
     v.append("    reg [7:0]  read_byte;")
     v.append("    ")
     v.append("    wire [15:0] rx_next = {rx_shift[14:0], mosi};")
+    v.append(f"    localparam [{bit_count_width-1}:0] BITCOUNT_MAX = {bit_count_width}'d{(1 << bit_count_width) - 1};")
     v.append("    ")
 
     v.append("    // Register file storage (only for registers with RW fields)")
@@ -239,54 +224,6 @@ def generate_verilog(registers, output_file):
         if has_rw:
             v.append(f"    reg [7:0] {reg['name']}_reg;")
     v.append("")
-
-    # Add 2-FF synchronizers for all RO inputs (CDC protection)
-    if ro_fields:
-        v.append("    //========================================================================")
-        v.append("    // 2-FF Synchronizers for RO inputs (CDC protection)")
-        v.append("    // Prevents metastability from async inputs propagating to MISO output")
-        v.append("    //========================================================================")
-        v.append("    ")
-        
-        # Declare sync registers
-        for field in ro_fields:
-            signal_name = f"{field['reg_name']}_{field['name']}"
-            if field["width"] == 1:
-                v.append(f"    reg {signal_name}_sync1, {signal_name}_sync2;")
-            else:
-                v.append(f"    reg [{field['width']-1}:0] {signal_name}_sync1, {signal_name}_sync2;")
-        
-        v.append("")
-        v.append("    // Synchronizer logic: input → sync1 → sync2")
-        v.append("    always @(posedge sclk or negedge rst_n) begin")
-        v.append("        if (!rst_n) begin")
-        
-        # Reset sync registers
-        for field in ro_fields:
-            signal_name = f"{field['reg_name']}_{field['name']}"
-            if field["width"] == 1:
-                v.append(f"            {signal_name}_sync1 <= 1'b0;")
-                v.append(f"            {signal_name}_sync2 <= 1'b0;")
-            else:
-                v.append(f"            {signal_name}_sync1 <= {field['width']}'d0;")
-                v.append(f"            {signal_name}_sync2 <= {field['width']}'d0;")
-        
-        v.append("        end")
-        v.append("        else begin")
-        v.append("            // First stage")
-        for field in ro_fields:
-            signal_name = f"{field['reg_name']}_{field['name']}"
-            v.append(f"            {signal_name}_sync1 <= {signal_name}_i;")
-        
-        v.append("            // Second stage (output)")
-        for field in ro_fields:
-            signal_name = f"{field['reg_name']}_{field['name']}"
-            v.append(f"            {signal_name}_sync2 <= {signal_name}_sync1;")
-        
-        v.append("        end")
-        v.append("    end")
-        v.append("")
-
 
     # Combinational read mux (read_byte) - FIXED FOR MIXED FIELDS
     v.append("    //========================================================================")
@@ -309,8 +246,8 @@ def generate_verilog(registers, output_file):
                 for bit in range(field["lsb"], field["msb"] + 1):
                     bit_sources[7 - bit] = f"{reg['name']}_reg[{bit}]"
             else:
-                # RO field comes from synchronized input (CDC-safe)
-                sig = f"{reg['name']}_{field['name']}_sync2"
+                # RO field comes from input port
+                sig = f"{reg['name']}_{field['name']}_i"
                 for bit in range(field["lsb"], field["msb"] + 1):
                     if field["width"] == 1:
                         bit_sources[7 - bit] = sig
@@ -329,10 +266,9 @@ def generate_verilog(registers, output_file):
     v.append("    end")
     v.append("")
 
-    # SPI Receive block (posedge sclk) - owns addr and byte_count
+    # SPI Receive block (posedge sclk) - FIXED: CS_N is synchronous
     v.append("    //========================================================================")
     v.append("    // SPI Receive (Mode 0): sample MOSI on SCLK rising edge")
-    v.append("    // This block owns addr and byte_count (single procedural driver)")
     v.append("    //========================================================================")
     v.append("    ")
     v.append("    always @(posedge sclk or posedge cs_n or negedge rst_n) begin")
@@ -351,7 +287,7 @@ def generate_verilog(registers, output_file):
     v.append("            addr      <= 7'd0;")
     v.append("            byte_count <= 8'd0;")
     v.append("        end")
-    v.append("        else begin")
+    v.append("        else if (bit_count < BITCOUNT_MAX) begin")
     v.append("            // Shift in MOSI")
     v.append("")
     v.append("            // Capture RW bit on first clock")
@@ -365,10 +301,12 @@ def generate_verilog(registers, output_file):
     v.append("                byte_count <= 8'd0;  // Reset byte counter at start")
     v.append("            end")
     v.append("")
-    v.append("            // Auto-increment address at byte boundaries for BOTH reads AND writes")
+    v.append("            // Auto-increment address at byte boundaries for both reads and writes")
     v.append("            // Triggers at bit_count==15, 23, 31, ... (when lower 3 bits == 7)")
-    v.append("            // Address saturates at max (no wrap)")
-    v.append(f"            if (bit_count >= {bit_count_width}'d15 && ((bit_count[2:0]) == 3'd7)) begin")
+    v.append("            // Address saturates at 0x7F (no wrap)")
+    v.append("            // For READS: increment happens here so new addr is ready before negedge reload")
+    v.append("            // For WRITES: we don't increment here; write block handles it after commit")
+    v.append(f"            if (!rw_bit && bit_count >= {bit_count_width}'d15 && ((bit_count[2:0]) == 3'd7)) begin")
     v.append(f"                if (addr < 7'd{max_addr})")
     v.append(f"                    addr <= addr + 7'd1;  // Saturates at 0x{max_addr:02X}")
     v.append("                byte_count <= byte_count + 8'd1;")
@@ -376,9 +314,10 @@ def generate_verilog(registers, output_file):
     v.append("")
     v.append("            // Always shift and increment bit counter")
     v.append("            rx_shift <= rx_next;")
-    v.append(f"            // Saturate bit_count at max to prevent wraparound after 128 bytes")
-    v.append(f"            if (bit_count < {bit_count_width}'d{(1 << bit_count_width) - 1})")
-    v.append(f"                bit_count <= bit_count + {bit_count_width}'d1;")
+    v.append(f"            bit_count <= bit_count + {bit_count_width}'d1;")
+    v.append("        end")
+    v.append("        else begin")
+    v.append("            // Transfer too long: ignore extra clocks until cs_n deasserts")
     v.append("        end")
     v.append("    end")
     v.append("")
@@ -409,7 +348,7 @@ def generate_verilog(registers, output_file):
     v.append("            // Write commits at every byte boundary: bit_count==15, 23, 31, ...")
     v.append("            // For multi-byte writes: each complete data byte triggers a write")
     v.append("            // Check: bit_count>=15 AND (bit_count-15) is a multiple of 8")
-    v.append(f"            if (rw_bit && bit_count >= {bit_count_width}'d15 && ((bit_count[2:0]) == 3'd7)) begin")
+    v.append(f"            if (rw_bit && (bit_count < BITCOUNT_MAX) && bit_count >= {bit_count_width}'d15 && ((bit_count[2:0]) == 3'd7)) begin")
     v.append("                // On byte boundary, rx_next[7:0] contains the complete data byte")
     v.append("                case (addr)")
     for reg in registers:
@@ -439,13 +378,16 @@ def generate_verilog(registers, output_file):
                 v.append(f"                    7'h{reg['addr']:02x}: {reg['name']}_reg <= rx_next[7:0];")
     v.append("                    default: ;")
     v.append("                endcase")
-    v.append("                // Note: addr and byte_count increment handled in receive block")
+    v.append("                // After write, increment address (saturates at max)")
+    v.append(f"                if (addr < 7'd{max_addr})")
+    v.append(f"                    addr <= addr + 7'd1;  // Saturates at 0x{max_addr:02X}")
+    v.append("                byte_count <= byte_count + 8'd1;")
     v.append("            end")
     v.append("        end")
     v.append("    end")
     v.append("")
 
-    # SPI Transmit block (negedge sclk)
+    # SPI Transmit block (negedge sclk) - FIXED: use read_byte_reg
     v.append("    //========================================================================")
     v.append("    // SPI Transmit (Mode 0): update MISO on SCLK falling edge")
     v.append("    //========================================================================")
@@ -517,11 +459,8 @@ def generate_verilog(registers, output_file):
     print(f"  Total fields: {len(ro_fields) + len(rw_fields)}")
     print(f"    RW fields: {len(rw_fields)}")
     print(f"    RO fields: {len(ro_fields)}")
-    print(f"  Address width: {addr_width} bits (0x00-0x{max_addr:02X})")
+    print(f"  Address width: {addr_width} bits")
     print(f"  Data width: {data_width} bits")
-    print(f"  bit_count width: {bit_count_width} bits (max {2**bit_count_width} bits = {2**bit_count_width // 8} bytes)")
-    print(f"  Address behavior: Saturates at 0x{max_addr:02X} (no wrap)")
-    print(f"  Max transfer: {max_addr + 1} bytes per transaction")
 
 
 def main():
