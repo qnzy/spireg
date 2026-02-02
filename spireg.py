@@ -4,14 +4,23 @@ SPI Register Interface Generator
 Generates Verilog-2005 compatible SPI slave + register file from CSV specification
 The SPI and the registers are directly clocked with SCLK, no other clock is required.
 
-This script has been generated using an LLM.
+This script has been generated using an LLM and refined through code review.
 
 SPI protocol:
 - Byte 0: RW bit (1) + 7-bit address
 - Byte 1+: 8-bit data (write data or dummy for read)
 - rw: 1 for write, 0 for read
 - Multi-byte transfers: address auto-increments after each data byte
-- Address wraps at register file boundary (0x7F -> 0x00)
+- Address saturates at 0x7F (does NOT wrap to 0x00)
+- Maximum transfer: 128 bytes (1 command + 127 data bytes)
+- Mode 0: CPOL=0, CPHA=0
+
+Features:
+- 10-bit bit_count: supports up to 128-byte transfers
+- Address saturation: safe behavior when exceeding address space
+- Single procedural driver: synthesizable design (addr/byte_count owned by receive block)
+- Mixed RO/RW registers: bit-level write masking
+- Undefined register addresses: safely ignored
 
 CSV format:
 - First line must contain (in any order): reg_name,field_name,lsb,msb,type,reset
@@ -20,7 +29,7 @@ CSV format:
 - type can be rw (read/write) or ro (read only)
 - rw creates output from the regmap, ro generate input to the regmap
 
-Public domain / CCO
+Public domain / CC0
 """
 
 import csv
@@ -115,10 +124,19 @@ def _parse_reset_to_int(reset_str: str) -> int:
 
 
 def generate_verilog(registers, output_file):
-    """Generate complete SPI register interface"""
+    """
+    Generate complete SPI register interface with the following features:
+    - 10-bit bit_count: supports up to 128-byte transfers
+    - Address saturation: stops at 0x7F (no wrap to 0x00)
+    - Single procedural driver: addr/byte_count owned by receive block only
+    - Mode 0 (CPOL=0, CPHA=0)
+    - Mixed RO/RW register support with bit-level masking
+    """
 
     addr_width = 7
     data_width = 8
+    bit_count_width = 10  # 10 bits: 0-1023, supports 128 bytes (1 cmd + 127 data)
+    max_addr = 127  # Maximum valid 7-bit address (0x7F)
     num_regs = len(registers)
 
     # Assign sequential addresses
@@ -134,7 +152,7 @@ def generate_verilog(registers, output_file):
     v.append("// Protocol: Variable-length transfers")
     v.append("//   Byte 0: 1 RW bit + 7-bit address")
     v.append("//   Byte 1+: 8-bit data (auto-increment address after each byte)")
-    v.append("//   Address wraps at 0x7F -> 0x00")
+    v.append("//   Address saturates at 0x7F (no wrap), supports up to 128-byte transfers")
     v.append("// Mode 0: CPOL=0, CPHA=0")
     v.append("// Note: core drives MISO always; pad-ring may tri-state when cs_n=1")
     v.append("")
@@ -203,7 +221,7 @@ def generate_verilog(registers, output_file):
     v.append("    ")
     v.append("    // SPI receive/transmit state (Mode 0)")
     v.append("    reg [15:0] rx_shift;")
-    v.append("    reg [5:0]  bit_count;  // 6 bits to support up to 64 bits (8 bytes)")
+    v.append(f"    reg [{bit_count_width-1}:0]  bit_count;  // {bit_count_width} bits: supports 128-byte transfers")
     v.append("    reg        rw_bit;")
     v.append("    reg [6:0]  addr;")
     v.append("    reg [7:0]  byte_count;  // Track number of data bytes transferred")
@@ -263,15 +281,16 @@ def generate_verilog(registers, output_file):
     v.append("    end")
     v.append("")
 
-    # SPI Receive block (posedge sclk) - FIXED: CS_N is synchronous
+    # SPI Receive block (posedge sclk) - owns addr and byte_count
     v.append("    //========================================================================")
     v.append("    // SPI Receive (Mode 0): sample MOSI on SCLK rising edge")
+    v.append("    // This block owns addr and byte_count (single procedural driver)")
     v.append("    //========================================================================")
     v.append("    ")
     v.append("    always @(posedge sclk or posedge cs_n or negedge rst_n) begin")
     v.append("        if (!rst_n) begin")
     v.append("            rx_shift  <= 16'd0;")
-    v.append("            bit_count <= 6'd0;")
+    v.append(f"            bit_count <= {bit_count_width}'d0;")
     v.append("            rw_bit    <= 1'b0;")
     v.append("            addr      <= 7'd0;")
     v.append("            byte_count <= 8'd0;")
@@ -279,7 +298,7 @@ def generate_verilog(registers, output_file):
     v.append("        else if (cs_n) begin")
     v.append("            // Not selected: reset framing state")
     v.append("            rx_shift  <= 16'd0;")
-    v.append("            bit_count <= 6'd0;")
+    v.append(f"            bit_count <= {bit_count_width}'d0;")
     v.append("            rw_bit    <= 1'b0;")
     v.append("            addr      <= 7'd0;")
     v.append("            byte_count <= 8'd0;")
@@ -288,28 +307,30 @@ def generate_verilog(registers, output_file):
     v.append("            // Shift in MOSI")
     v.append("")
     v.append("            // Capture RW bit on first clock")
-    v.append("            if (bit_count == 6'd0) begin")
+    v.append(f"            if (bit_count == {bit_count_width}'d0) begin")
     v.append("                rw_bit <= mosi;")
     v.append("            end")
     v.append("")
     v.append("            // Capture address after 8 clocks (byte0 bits[6:0])")
-    v.append("            if (bit_count == 6'd7) begin")
+    v.append(f"            if (bit_count == {bit_count_width}'d7) begin")
     v.append("                addr <= rx_next[6:0];")
     v.append("                byte_count <= 8'd0;  // Reset byte counter at start")
     v.append("            end")
     v.append("")
-    v.append("            // Auto-increment address at byte boundaries for both reads and writes")
+    v.append("            // Auto-increment address at byte boundaries for BOTH reads AND writes")
     v.append("            // Triggers at bit_count==15, 23, 31, ... (when lower 3 bits == 7)")
-    v.append("            // For READS: increment happens here so new addr is ready before negedge reload")
-    v.append("            // For WRITES: we don't increment here; write block handles it after commit")
-    v.append("            if (!rw_bit && bit_count >= 6'd15 && ((bit_count[2:0]) == 3'd7)) begin")
-    v.append("                addr <= addr + 7'd1;  // Wraps naturally: 0x7F->0x00")
+    v.append("            // Address saturates at max (no wrap)")
+    v.append(f"            if (bit_count >= {bit_count_width}'d15 && ((bit_count[2:0]) == 3'd7)) begin")
+    v.append(f"                if (addr < 7'd{max_addr})")
+    v.append(f"                    addr <= addr + 7'd1;  // Saturates at 0x{max_addr:02X}")
     v.append("                byte_count <= byte_count + 8'd1;")
     v.append("            end")
     v.append("")
-    v.append("            // Always shift and increment bit counter (wraps at 32 -> 0)")
+    v.append("            // Always shift and increment bit counter")
     v.append("            rx_shift <= rx_next;")
-    v.append("            bit_count <= bit_count + 6'd1;  // Wraps naturally")
+    v.append(f"            // Saturate bit_count at max to prevent wraparound after 128 bytes")
+    v.append(f"            if (bit_count < {bit_count_width}'d{(1 << bit_count_width) - 1})")
+    v.append(f"                bit_count <= bit_count + {bit_count_width}'d1;")
     v.append("        end")
     v.append("    end")
     v.append("")
@@ -340,7 +361,7 @@ def generate_verilog(registers, output_file):
     v.append("            // Write commits at every byte boundary: bit_count==15, 23, 31, ...")
     v.append("            // For multi-byte writes: each complete data byte triggers a write")
     v.append("            // Check: bit_count>=15 AND (bit_count-15) is a multiple of 8")
-    v.append("            if (rw_bit && bit_count >= 6'd15 && ((bit_count[2:0]) == 3'd7)) begin")
+    v.append(f"            if (rw_bit && bit_count >= {bit_count_width}'d15 && ((bit_count[2:0]) == 3'd7)) begin")
     v.append("                // On byte boundary, rx_next[7:0] contains the complete data byte")
     v.append("                case (addr)")
     for reg in registers:
@@ -370,15 +391,13 @@ def generate_verilog(registers, output_file):
                 v.append(f"                    7'h{reg['addr']:02x}: {reg['name']}_reg <= rx_next[7:0];")
     v.append("                    default: ;")
     v.append("                endcase")
-    v.append("                // After write, increment address for next byte")
-    v.append("                addr <= addr + 7'd1;  // Wraps naturally: 0x7F->0x00")
-    v.append("                byte_count <= byte_count + 8'd1;")
+    v.append("                // Note: addr and byte_count increment handled in receive block")
     v.append("            end")
     v.append("        end")
     v.append("    end")
     v.append("")
 
-    # SPI Transmit block (negedge sclk) - FIXED: use read_byte_reg
+    # SPI Transmit block (negedge sclk)
     v.append("    //========================================================================")
     v.append("    // SPI Transmit (Mode 0): update MISO on SCLK falling edge")
     v.append("    //========================================================================")
@@ -399,13 +418,13 @@ def generate_verilog(registers, output_file):
     v.append("            // After address phase: for READ, start shifting out read data")
     v.append("            // At 8th falling edge (bit_count==8), addr is stable, read_byte is valid")
     v.append("            // For multi-byte reads, reload tx_shift at bit_count==16, 24, 32, ...")
-    v.append("            if (!rw_bit && (bit_count == 6'd8)) begin")
+    v.append(f"            if (!rw_bit && (bit_count == {bit_count_width}'d8)) begin")
     v.append("                // First data byte")
     v.append("                miso      <= read_byte[7];")
     v.append("                tx_shift  <= {read_byte[6:0], 1'b0};")
     v.append("                tx_active <= 1'b1;")
     v.append("            end")
-    v.append("            else if (!rw_bit && tx_active && bit_count >= 6'd16 && ((bit_count[2:0]) == 3'd0)) begin")
+    v.append(f"            else if (!rw_bit && tx_active && bit_count >= {bit_count_width}'d16 && ((bit_count[2:0]) == 3'd0)) begin")
     v.append("                // Reload for next byte at bit_count==16, 24, 32, ...")
     v.append("                // Address was already incremented by receive block")
     v.append("                miso      <= read_byte[7];")
@@ -450,8 +469,11 @@ def generate_verilog(registers, output_file):
     print(f"  Total fields: {len(ro_fields) + len(rw_fields)}")
     print(f"    RW fields: {len(rw_fields)}")
     print(f"    RO fields: {len(ro_fields)}")
-    print(f"  Address width: {addr_width} bits")
+    print(f"  Address width: {addr_width} bits (0x00-0x{max_addr:02X})")
     print(f"  Data width: {data_width} bits")
+    print(f"  bit_count width: {bit_count_width} bits (max {2**bit_count_width} bits = {2**bit_count_width // 8} bytes)")
+    print(f"  Address behavior: Saturates at 0x{max_addr:02X} (no wrap)")
+    print(f"  Max transfer: {max_addr + 1} bytes per transaction")
 
 
 def main():
