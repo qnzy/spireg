@@ -347,17 +347,62 @@ def generate_verilog(registers, output_file):
         "        case (addr)",
     ]
     for reg in registers:
-        bit_sources = ["1'b0"] * 8
+        # Build per-bit owner table: bit_owner[i] for bit i (0=LSB..7=MSB).
+        # RW bits:  "REGNAME_reg:N"   (N = register bit index)
+        # RO bits:  "signame:N"        (N = field-relative bit index)
+        # RO 1-bit: "signame"          (no index needed)
+        # Unused:   "1'b0"
+        bit_owner = ["1'b0"] * 8
         for f in reg["fields"]:
-            sig = (f"{reg['name']}_{f['name']}_sync2" if f["type"] == "ro"
-                   else f"{reg['name']}_reg")
             for bit in range(f["lsb"], f["msb"] + 1):
                 if f["type"] == "ro":
-                    bit_sources[7 - bit] = sig if f["width"] == 1 else f"{sig}[{bit - f['lsb']}]"
+                    sig = f"{reg['name']}_{f['name']}_sync2"
+                    bit_owner[bit] = sig if f["width"] == 1 else f"{sig}:{bit - f['lsb']}"
                 else:
-                    bit_sources[7 - bit] = f"{reg['name']}_reg[{bit}]"
-        v.append(f"            7'h{reg['addr']:02x}: read_byte = {{")
-        v.append("                " + ", ".join(bit_sources) + "};")
+                    bit_owner[bit] = f"{reg['name']}_reg:{bit}"
+
+        # Collapse consecutive bits from the same base signal into slices,
+        # scanning MSB-first (bit 7 down to 0) to produce the concat order.
+        segments = []
+        b = 7
+        while b >= 0:
+            owner = bit_owner[b]
+            if owner == "1'b0":
+                run_msb = b
+                while b >= 0 and bit_owner[b] == "1'b0":
+                    b -= 1
+                width = run_msb - (b + 1) + 1
+                segments.append(f"{width}'b0" if width > 1 else "1'b0")
+            elif ":" in owner:
+                base, idx_str = owner.rsplit(":", 1)
+                top_idx = int(idx_str)   # signal-bit index at position b
+                run_msb = b
+                while b >= 0 and ":" in bit_owner[b]:
+                    cur_base, cur_idx = bit_owner[b].rsplit(":", 1)
+                    if cur_base != base or int(cur_idx) != top_idx - (run_msb - b):
+                        break
+                    b -= 1
+                run_lsb = b + 1
+                sig_hi = top_idx
+                sig_lo = top_idx - (run_msb - run_lsb)
+                segments.append(f"{base}[{sig_hi}]" if sig_hi == sig_lo
+                                 else f"{base}[{sig_hi}:{sig_lo}]")
+            else:
+                # Bare 1-bit RO signal (no index)
+                segments.append(owner)
+                b -= 1
+
+        # Emit on one line if it fits in 80 chars, else one segment per line
+        prefix = f"            7'h{reg['addr']:02x}: read_byte = {{"
+        joined = ", ".join(segments)
+        if len(prefix) + len(joined) + 2 <= 80:
+            v.append(f"{prefix}{joined}}};")
+        else:
+            v.append(prefix)
+            for i, seg in enumerate(segments):
+                comma = "," if i < len(segments) - 1 else ""
+                v.append(f"                {seg}{comma}")
+            v.append("            };")
     v += [
         "            default: read_byte = 8'h00;",
         "        endcase",
