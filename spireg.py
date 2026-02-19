@@ -10,7 +10,7 @@ SPI protocol:
 - rw: 1 for write, 0 for read
 - Multi-byte transfers: address auto-increments after each data byte
 - Address saturates at 0x7F (does NOT wrap to 0x00)
-- Maximum transfer: 128 bytes (1 command + 127 data bytes)
+- Maximum transfer: 127 bytes (1 command + 126 data bytes)
 - Mode 0: CPOL=0, CPHA=0
 
 CSV format:
@@ -22,7 +22,8 @@ CSV format:
 
 Synthesizability notes:
 - All always blocks use at most one clock edge plus one async reset.
-- posedge cs_n is used as async reset on receive and TX blocks (one clock + one async = standard FF).
+- A combined reset wire (spi_arst = cs_n | ~rst_n) is used on receive and TX blocks,
+  giving a true 2-edge sensitivity list (one clock + one async).
 - No 3-edge sensitivity lists are generated.
 - 2-FF synchronizers are clocked by SCLK. This limits metastability settling time to
   one SCLK half-period when SCLK is toggling; use with care for very fast SCLK rates.
@@ -32,21 +33,31 @@ Synthesizability notes:
 import csv
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Valid Verilog-2005 identifier: starts with letter or underscore, rest alphanumeric/_
 _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
-MAX_REGS = 128  # 7-bit address space
+MAX_REGS = 128   # 7-bit address space
+ADDR_WIDTH = 7
+DATA_WIDTH = 8
+BCW = 10         # bit_count width: 0..1023, covers 1 cmd byte + 126 data bytes
+MAX_ADDR = 127   # saturate here, no wrap
 
+
+# =============================================================================
+# Helpers
+# =============================================================================
 
 def _check_identifier(name: str, context: str) -> None:
     if not _IDENT_RE.match(name):
         raise ValueError(f"'{name}' in {context} is not a valid Verilog identifier")
 
 
-def _parse_reset_to_int(reset_str: str) -> int:
-    s = reset_str.strip()
+def _parse_int(s: str) -> int:
+    """Parse decimal, hex (0x), or binary (0b) integer string."""
+    s = s.strip()
     if not s:
         return 0
     if s.startswith(("0x", "0X")):
@@ -56,85 +67,53 @@ def _parse_reset_to_int(reset_str: str) -> int:
     return int(s, 10)
 
 
-def parse_csv(csv_file):
-    """Parse CSV file and return register definitions."""
+def _reg_reset_byte(reg: dict) -> int:
+    """Compute the reset value byte for the RW portion of a register."""
+    value = 0
+    for f in reg["fields"]:
+        if f["type"] == "rw":
+            mask = (1 << f["width"]) - 1
+            value |= (_parse_int(f["reset"]) & mask) << f["lsb"]
+    return value
+
+
+def _zero_literal(width: int) -> str:
+    return "1'b0" if width == 1 else f"{width}'d0"
+
+
+def _port_width(width: int) -> str:
+    """Return the port width specifier string (with trailing space for alignment)."""
+    return f"[{width - 1}:0] " if width > 1 else "      "
+
+
+# =============================================================================
+# CSV parsing
+# =============================================================================
+
+def parse_csv(csv_file: str) -> list:
+    """
+    Parse CSV and return a list of register dicts:
+      {name, addr, fields: [{name, lsb, msb, width, type, reset, reg_name, reg_addr}]}
+    """
     registers = []
 
-    with open(csv_file, "r") as f:
-        reader = csv.DictReader(f)
+    with open(csv_file, "r") as fh:
+        reader = csv.DictReader(fh)
 
-        required_cols = {"reg_name", "field_name", "lsb", "msb", "type", "reset"}
-        if not required_cols.issubset(set(reader.fieldnames or [])):
-            raise ValueError(f"CSV must contain columns: {required_cols}")
+        required = {"reg_name", "field_name", "lsb", "msb", "type", "reset"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(f"CSV must contain columns: {required}")
 
         current_reg = None
         last_reg_name = None
-        seen_reg_names = {}  # name -> True, to detect non-contiguous reuse
+        seen_reg_names = {}
 
         for row in reader:
-            reg_name = (row.get("reg_name") or "").strip()
-            if not reg_name:
-                if last_reg_name is None:
-                    raise ValueError("First row must have a reg_name")
-                reg_name = last_reg_name
-            else:
-                last_reg_name = reg_name
-
-            _check_identifier(reg_name, "reg_name column")
-
-            field_name = (row.get("field_name") or "").strip()
-            if not field_name:
-                raise ValueError(f"field_name is empty in register '{reg_name}'")
-            _check_identifier(field_name, f"register '{reg_name}'")
-
-            lsb = int(row["lsb"])
-            msb = int(row["msb"])
-            field_type = (row.get("type") or "").strip().lower()
-            reset_val = (row.get("reset") or "").strip()
-
-            if field_type not in ("rw", "ro"):
-                raise ValueError(
-                    f"Invalid type '{field_type}' for {reg_name}.{field_name}. Must be 'rw' or 'ro'"
-                )
-
-            if lsb > msb or msb > 7 or lsb < 0:
-                raise ValueError(
-                    f"Invalid bit range [{msb}:{lsb}] for {reg_name}.{field_name}"
-                )
-
-            # Start new register or add field to current
-            if current_reg is None or current_reg["name"] != reg_name:
-                if reg_name in seen_reg_names:
-                    print(
-                        f"Warning: register '{reg_name}' appears non-contiguously in CSV; "
-                        f"it will be assigned a new address (not merged with earlier occurrence).",
-                        file=sys.stderr,
-                    )
-                if current_reg is not None:
-                    registers.append(current_reg)
-                current_reg = {"name": reg_name, "fields": []}
-                seen_reg_names[reg_name] = True
-
-            reset_int = _parse_reset_to_int(reset_val) if reset_val else 0
-            field_max = (1 << (msb - lsb + 1)) - 1
-            if reset_int > field_max:
-                print(
-                    f"Warning: reset value {reset_val!r} for {reg_name}.{field_name} "
-                    f"exceeds field width ({msb - lsb + 1} bits, max {field_max}); "
-                    f"value will be truncated.",
-                    file=sys.stderr,
-                )
-
-            current_reg["fields"].append(
-                {
-                    "name": field_name,
-                    "lsb": lsb,
-                    "msb": msb,
-                    "width": msb - lsb + 1,
-                    "type": field_type,
-                    "reset": reset_val,
-                }
+            reg_name, current_reg, last_reg_name = _resolve_reg_name(
+                row, current_reg, last_reg_name, seen_reg_names, registers
             )
+            field = _parse_field(row, reg_name)
+            current_reg["fields"].append(field)
 
         if current_reg is not None:
             registers.append(current_reg)
@@ -145,137 +124,161 @@ def parse_csv(csv_file):
             f"supports at most {MAX_REGS}."
         )
 
-    # Check for field overlaps within each register
-    for reg in registers:
-        bits_used = [False] * 8
-        for field in reg["fields"]:
-            for bit in range(field["lsb"], field["msb"] + 1):
-                if bits_used[bit]:
-                    raise ValueError(
-                        f"Bit {bit} in register '{reg['name']}' is used by multiple fields"
-                    )
-                bits_used[bit] = True
-
+    _validate_field_overlaps(registers)
+    _assign_addresses(registers)
     return registers
 
 
-def generate_verilog(registers, output_file):
-    """
-    Generate synthesizable SPI register interface.
+def _resolve_reg_name(row, current_reg, last_reg_name, seen_reg_names, registers):
+    """Determine the current register name, creating a new register dict if needed."""
+    reg_name = (row.get("reg_name") or "").strip()
+    if not reg_name:
+        if last_reg_name is None:
+            raise ValueError("First row must have a reg_name")
+        reg_name = last_reg_name
+    else:
+        last_reg_name = reg_name
 
-    Synthesizability strategy:
-      - Receive block:  clock=posedge sclk, async-reset=posedge cs_n (also negedge rst_n)
-                        Standard 2-edge FF. Resets on CS deassert (end of transaction).
-      - Write block:    clock=posedge sclk, async-reset=negedge rst_n only.
-                        CS gated by level (!cs_n) in body. Standard 2-edge FF.
-      - TX block:       clock=negedge sclk, async-reset=posedge cs_n (also negedge rst_n).
-                        Standard 2-edge FF.
-      - Synchronizers:  clock=posedge sclk, async-reset=negedge rst_n. Standard 2-edge FF.
-      No 3-edge sensitivity lists anywhere.
+    _check_identifier(reg_name, "reg_name column")
 
-    Read path timing:
-      addr is captured on posedge sclk at bit_count==7.
-      read_byte is combinational from addr.
-      TX block samples read_byte on negedge sclk at bit_count==8.
-      This gives one full SCLK half-period for addr->read_byte to settle.
-      Constrain: Tcomb(addr->read_byte) + Tsetup(TX FF) < T_sclk/2.
-    """
+    if current_reg is None or current_reg["name"] != reg_name:
+        if reg_name in seen_reg_names:
+            print(
+                f"Warning: register '{reg_name}' appears non-contiguously in CSV; "
+                "it will be assigned a new address (not merged with earlier occurrence).",
+                file=sys.stderr,
+            )
+        if current_reg is not None:
+            registers.append(current_reg)
+        current_reg = {"name": reg_name, "fields": []}
+        seen_reg_names[reg_name] = True
 
-    addr_width = 7
-    data_width = 8
-    BCW = 10          # bit_count width: 0..1023, covers 1 cmd byte + 127 data bytes
-    MAX_ADDR = 127    # saturate here, no wrap
-    num_regs = len(registers)
+    return reg_name, current_reg, last_reg_name
 
-    # Assign sequential addresses
+
+def _parse_field(row: dict, reg_name: str) -> dict:
+    """Parse and validate a single field row."""
+    field_name = (row.get("field_name") or "").strip()
+    if not field_name:
+        raise ValueError(f"field_name is empty in register '{reg_name}'")
+    _check_identifier(field_name, f"register '{reg_name}'")
+
+    lsb = int(row["lsb"])
+    msb = int(row["msb"])
+    field_type = (row.get("type") or "").strip().lower()
+    reset_str = (row.get("reset") or "").strip()
+
+    if field_type not in ("rw", "ro"):
+        raise ValueError(
+            f"Invalid type '{field_type}' for {reg_name}.{field_name}. Must be 'rw' or 'ro'"
+        )
+    if lsb > msb or msb > 7 or lsb < 0:
+        raise ValueError(f"Invalid bit range [{msb}:{lsb}] for {reg_name}.{field_name}")
+
+    width = msb - lsb + 1
+    reset_int = _parse_int(reset_str)
+    field_max = (1 << width) - 1
+    if reset_int > field_max:
+        print(
+            f"Warning: reset value {reset_str!r} for {reg_name}.{field_name} "
+            f"exceeds field width ({width} bits, max {field_max}); value will be truncated.",
+            file=sys.stderr,
+        )
+
+    return {
+        "name": field_name,
+        "lsb": lsb,
+        "msb": msb,
+        "width": width,
+        "type": field_type,
+        "reset": reset_str,
+    }
+
+
+def _validate_field_overlaps(registers: list) -> None:
+    for reg in registers:
+        used = [False] * 8
+        for f in reg["fields"]:
+            for bit in range(f["lsb"], f["msb"] + 1):
+                if used[bit]:
+                    raise ValueError(
+                        f"Bit {bit} in register '{reg['name']}' is used by multiple fields"
+                    )
+                used[bit] = True
+
+
+def _assign_addresses(registers: list) -> None:
+    """Assign sequential addresses and annotate reg_name/reg_addr onto each field."""
     for idx, reg in enumerate(registers):
         reg["addr"] = idx
+        for f in reg["fields"]:
+            f["reg_name"] = reg["name"]
+            f["reg_addr"] = reg["addr"]
 
-    # Collect field lists (also annotate reg_name/addr onto each field)
-    ro_fields = []
-    rw_fields = []
-    for reg in registers:
-        for field in reg["fields"]:
-            field["reg_name"] = reg["name"]
-            field["reg_addr"] = reg["addr"]
-            (ro_fields if field["type"] == "ro" else rw_fields).append(field)
 
-    v = []
+# =============================================================================
+# Verilog generation helpers
+# =============================================================================
 
-    # -------------------------------------------------------------------------
-    # Header
-    # -------------------------------------------------------------------------
-    v += [
-        "// Auto-generated SPI Register Interface",
-        "// Generated by spireg.py from CSV specification",
-        "// Verilog-2005 compatible, synthesizable (single clock + single async per block)",
-        "//",
-        "// Protocol: Variable-length transfers",
-        "//   Byte 0 : 1 RW bit + 7-bit address",
-        "//   Byte 1+: 8-bit data (address auto-increments after each byte)",
-        "//   Address saturates at 0x7F (no wrap); up to 127 data bytes per transfer",
-        "// Mode 0: CPOL=0, CPHA=0",
-        "//",
-        "// Reset / CS strategy:",
-        "//   rst_n    : async system reset, resets everything",
-        "//   cs_n     : posedge used as async reset on receive and TX blocks",
-        "//              (resets framing state at end of transaction - valid because",
-        "//               master must hold CS high before starting a new transaction)",
-        "//              Write block uses cs_n as level gate only (not in sensitivity list)",
-        "//",
-        "// MISO: core drives MISO at all times; pad-ring should tri-state when cs_n=1",
-        "`timescale 1ns / 1ps",
-        "",
-    ]
+def _build_port_list(ro_fields: list, rw_fields: list) -> list:
+    """
+    Return list of (kind, line) tuples where kind is 'port', 'comment', or 'blank'.
+    """
+    items = []
 
-    # -------------------------------------------------------------------------
-    # Port list
-    # -------------------------------------------------------------------------
-    port_items = []
-    port_items.append(("comment", "    // SPI interface"))
-    port_items.append(("port",    "    input  wire       sclk"))
-    port_items.append(("port",    "    input  wire       mosi"))
-    port_items.append(("port",    "    output reg        miso"))
-    port_items.append(("port",    "    input  wire       cs_n"))
-    port_items.append(("blank",   ""))
-    port_items.append(("comment", "    // System reset (active low, async)"))
-    port_items.append(("port",    "    input  wire       rst_n"))
+    def comment(s):  items.append(("comment", s))
+    def port(s):     items.append(("port",    s))
+    def blank():     items.append(("blank",   ""))
+
+    comment("    // SPI interface")
+    port(   "    input  wire       sclk")
+    port(   "    input  wire       mosi")
+    port(   "    output reg        miso")
+    port(   "    input  wire       cs_n")
+    blank()
+    comment("    // System reset (active low, async)")
+    port(   "    input  wire       rst_n")
 
     if ro_fields:
-        port_items.append(("blank",   ""))
-        port_items.append(("comment", "    // Read-only field inputs (from chip internals)"))
+        blank()
+        comment("    // Read-only field inputs (from chip internals)")
         for f in ro_fields:
             sig = f"{f['reg_name']}_{f['name']}_i"
-            w = f"[{f['width']-1}:0] " if f["width"] > 1 else "      "
-            port_items.append(("port", f"    input  wire {w}{sig}"))
+            port(f"    input  wire {_port_width(f['width'])}{sig}")
 
     if rw_fields:
-        port_items.append(("blank",   ""))
-        port_items.append(("comment", "    // Read-write field outputs (to chip internals)"))
+        blank()
+        comment("    // Read-write field outputs (to chip internals)")
         for f in rw_fields:
             sig = f"{f['reg_name']}_{f['name']}_o"
-            w = f"[{f['width']-1}:0] " if f["width"] > 1 else "      "
-            port_items.append(("port", f"    output wire {w}{sig}"))
+            port(f"    output wire {_port_width(f['width'])}{sig}")
 
-    last_port_idx = max(i for i, (k, _) in enumerate(port_items) if k == "port")
-    v.append("module spi_reg_interface (")
-    for i, (kind, line) in enumerate(port_items):
+    return items
+
+
+def _emit_module_header(ro_fields: list, rw_fields: list) -> list:
+    """Return lines for the module declaration."""
+    items = _build_port_list(ro_fields, rw_fields)
+    last_port_idx = max(i for i, (k, _) in enumerate(items) if k == "port")
+
+    lines = ["module spi_reg_interface ("]
+    for i, (kind, line) in enumerate(items):
         if kind == "port":
-            v.append(line + ("," if i != last_port_idx else ""))
+            lines.append(line + ("," if i != last_port_idx else ""))
         else:
-            v.append(line)
-    v += [");", "", ""]
+            lines.append(line)
+    lines += [");", "", ""]
+    return lines
 
-    # -------------------------------------------------------------------------
-    # Declarations
-    # -------------------------------------------------------------------------
-    v += [
+
+def _emit_declarations(registers: list, ro_fields: list) -> list:
+    lines = [
         "    //====================================================================",
         "    // Internal Declarations",
         "    //====================================================================",
         "",
         "    // SPI framing state",
-        "    reg [15:0]          rx_shift;   // 2-byte shift register (cmd + data)",
+        "    reg [7:0]           rx_shift;   // 1-byte shift register",
         f"    reg [{BCW-1}:0]         bit_count;  // {BCW}-bit counter, saturates at {(1<<BCW)-1}",
         "    reg                 rw_bit;     // captured R/W bit from byte 0",
         "    reg [6:0]           addr;       // captured 7-bit register address",
@@ -287,20 +290,21 @@ def generate_verilog(registers, output_file):
         "    // Combinational read data (registered name kept for clarity)",
         "    reg [7:0]           read_byte;  // driven by always@*, not a flop",
         "",
-        "    wire [15:0] rx_next = {rx_shift[14:0], mosi};",
+        "    wire [7:0] rx_next = {rx_shift[6:0], mosi};",
+        "",
+        "    // Combined async reset: cs_n deassert OR system reset (true 2-edge FF)",
+        "    wire spi_arst = cs_n | ~rst_n;",
         "",
     ]
 
-    # RW register storage
-    v.append("    // RW register storage")
+    lines.append("    // RW register storage")
     for reg in registers:
         if any(f["type"] == "rw" for f in reg["fields"]):
-            v.append(f"    reg [7:0] {reg['name']}_reg;")
-    v.append("")
+            lines.append(f"    reg [7:0] {reg['name']}_reg;")
+    lines.append("")
 
-    # 2-FF synchronizers for RO inputs
     if ro_fields:
-        v += [
+        lines += [
             "    //====================================================================",
             "    // 2-FF Synchronizers for RO inputs",
             "    // Clock: SCLK. Metastability settling time = 1 SCLK half-period.",
@@ -311,30 +315,86 @@ def generate_verilog(registers, output_file):
         for f in ro_fields:
             sig = f"{f['reg_name']}_{f['name']}"
             w = f"[{f['width']-1}:0] " if f["width"] > 1 else ""
-            v.append(f"    reg {w}{sig}_sync1, {sig}_sync2;")
-        v.append("")
+            lines.append(f"    reg {w}{sig}_sync1, {sig}_sync2;")
+        lines.append("")
 
-        v.append("    always @(posedge sclk or negedge rst_n) begin")
-        v.append("        if (!rst_n) begin")
+        lines.append("    always @(posedge sclk or negedge rst_n) begin")
+        lines.append("        if (!rst_n) begin")
         for f in ro_fields:
             sig = f"{f['reg_name']}_{f['name']}"
-            zero = "1'b0" if f["width"] == 1 else f"{f['width']}'d0"
-            v.append(f"            {sig}_sync1 <= {zero};")
-            v.append(f"            {sig}_sync2 <= {zero};")
-        v.append("        end")
-        v.append("        else begin")
+            lines.append(f"            {sig}_sync1 <= {_zero_literal(f['width'])};")
+            lines.append(f"            {sig}_sync2 <= {_zero_literal(f['width'])};")
+        lines.append("        end")
+        lines.append("        else begin")
         for f in ro_fields:
             sig = f"{f['reg_name']}_{f['name']}"
-            v.append(f"            {sig}_sync1 <= {sig}_i;")
-            v.append(f"            {sig}_sync2 <= {sig}_sync1;")
-        v.append("        end")
-        v.append("    end")
-        v.append("")
+            lines.append(f"            {sig}_sync1 <= {sig}_i;")
+            lines.append(f"            {sig}_sync2 <= {sig}_sync1;")
+        lines.append("        end")
+        lines.append("    end")
+        lines.append("")
 
-    # -------------------------------------------------------------------------
-    # Combinational read mux
-    # -------------------------------------------------------------------------
-    v += [
+    return lines
+
+
+def _build_read_mux_segments(reg: dict) -> list:
+    """
+    For a register, compute the list of Verilog slice/literal segments
+    that make up read_byte, MSB-first, for use in a concatenation.
+    """
+    # Build per-bit owner table
+    # RW bits  -> "REGNAME_reg:N"   (N = register bit index)
+    # RO 1-bit -> "signame"          (bare, no index)
+    # RO N-bit -> "signame:N"        (N = field-relative bit index)
+    # Unused   -> "1'b0"
+    bit_owner = ["1'b0"] * 8
+    for f in reg["fields"]:
+        for bit in range(f["lsb"], f["msb"] + 1):
+            if f["type"] == "ro":
+                sig = f"{reg['name']}_{f['name']}_sync2"
+                bit_owner[bit] = sig if f["width"] == 1 else f"{sig}:{bit - f['lsb']}"
+            else:
+                bit_owner[bit] = f"{reg['name']}_reg:{bit}"
+
+    # Collapse runs of identical base signal into slices (scan MSB-first)
+    segments = []
+    b = 7
+    while b >= 0:
+        owner = bit_owner[b]
+
+        if owner == "1'b0":
+            run_msb = b
+            while b >= 0 and bit_owner[b] == "1'b0":
+                b -= 1
+            width = run_msb - (b + 1) + 1
+            segments.append(f"{width}'b0" if width > 1 else "1'b0")
+
+        elif ":" in owner:
+            base, idx_str = owner.rsplit(":", 1)
+            top_idx = int(idx_str)
+            run_msb = b
+            while b >= 0 and ":" in bit_owner[b]:
+                cur_base, cur_idx = bit_owner[b].rsplit(":", 1)
+                if cur_base != base or int(cur_idx) != top_idx - (run_msb - b):
+                    break
+                b -= 1
+            run_lsb = b + 1
+            sig_hi = top_idx
+            sig_lo = top_idx - (run_msb - run_lsb)
+            segments.append(
+                f"{base}[{sig_hi}]" if sig_hi == sig_lo else f"{base}[{sig_hi}:{sig_lo}]"
+            )
+
+        else:
+            # Bare 1-bit RO signal
+            segments.append(owner)
+            b -= 1
+
+    return segments
+
+
+def _emit_read_mux(registers: list) -> list:
+    lines = [
         "    //====================================================================",
         "    // Combinational Read Mux",
         "    // read_byte is valid one combinational delay after addr is updated.",
@@ -346,88 +406,41 @@ def generate_verilog(registers, output_file):
         "        read_byte = 8'h00;",
         "        case (addr)",
     ]
+
     for reg in registers:
-        # Build per-bit owner table: bit_owner[i] for bit i (0=LSB..7=MSB).
-        # RW bits:  "REGNAME_reg:N"   (N = register bit index)
-        # RO bits:  "signame:N"        (N = field-relative bit index)
-        # RO 1-bit: "signame"          (no index needed)
-        # Unused:   "1'b0"
-        bit_owner = ["1'b0"] * 8
-        for f in reg["fields"]:
-            for bit in range(f["lsb"], f["msb"] + 1):
-                if f["type"] == "ro":
-                    sig = f"{reg['name']}_{f['name']}_sync2"
-                    bit_owner[bit] = sig if f["width"] == 1 else f"{sig}:{bit - f['lsb']}"
-                else:
-                    bit_owner[bit] = f"{reg['name']}_reg:{bit}"
-
-        # Collapse consecutive bits from the same base signal into slices,
-        # scanning MSB-first (bit 7 down to 0) to produce the concat order.
-        segments = []
-        b = 7
-        while b >= 0:
-            owner = bit_owner[b]
-            if owner == "1'b0":
-                run_msb = b
-                while b >= 0 and bit_owner[b] == "1'b0":
-                    b -= 1
-                width = run_msb - (b + 1) + 1
-                segments.append(f"{width}'b0" if width > 1 else "1'b0")
-            elif ":" in owner:
-                base, idx_str = owner.rsplit(":", 1)
-                top_idx = int(idx_str)   # signal-bit index at position b
-                run_msb = b
-                while b >= 0 and ":" in bit_owner[b]:
-                    cur_base, cur_idx = bit_owner[b].rsplit(":", 1)
-                    if cur_base != base or int(cur_idx) != top_idx - (run_msb - b):
-                        break
-                    b -= 1
-                run_lsb = b + 1
-                sig_hi = top_idx
-                sig_lo = top_idx - (run_msb - run_lsb)
-                segments.append(f"{base}[{sig_hi}]" if sig_hi == sig_lo
-                                 else f"{base}[{sig_hi}:{sig_lo}]")
-            else:
-                # Bare 1-bit RO signal (no index)
-                segments.append(owner)
-                b -= 1
-
-        # Emit on one line if it fits in 80 chars, else one segment per line
-        prefix = f"            7'h{reg['addr']:02x}: read_byte = {{"
+        segments = _build_read_mux_segments(reg)
         joined = ", ".join(segments)
+        prefix = f"            7'h{reg['addr']:02x}: read_byte = {{"
         if len(prefix) + len(joined) + 2 <= 80:
-            v.append(f"{prefix}{joined}}};")
+            lines.append(f"{prefix}{joined}}};")
         else:
-            v.append(prefix)
+            lines.append(prefix)
             for i, seg in enumerate(segments):
                 comma = "," if i < len(segments) - 1 else ""
-                v.append(f"                {seg}{comma}")
-            v.append("            };")
-    v += [
+                lines.append(f"                {seg}{comma}")
+            lines.append("            };")
+
+    lines += [
         "            default: read_byte = 8'h00;",
         "        endcase",
         "    end",
         "",
     ]
+    return lines
 
-    # -------------------------------------------------------------------------
-    # Receive block
-    # Sensitivity: posedge sclk, posedge cs_n (async reset), negedge rst_n (async reset)
-    # Synthesis: standard 2-edge FF (clock=sclk, async=cs_n|rst_n combined reset)
-    # Note: rst_n has priority over cs_n because it comes first in the if-chain.
-    # Most synthesis tools accept this as: async reset = (!rst_n | cs_n).
-    # -------------------------------------------------------------------------
-    v += [
+
+def _emit_receive_block() -> list:
+    return [
         "    //====================================================================",
         "    // SPI Receive Block (Mode 0: sample MOSI on rising SCLK)",
-        "    // Async reset: posedge cs_n (end of transaction) or negedge rst_n",
+        "    // Async reset: spi_arst (cs_n | ~rst_n) — true 2-edge FF.",
         "    // Resets framing state when CS deasserts so the next transaction",
         "    // always starts from a known state.",
         "    //====================================================================",
         "",
-        "    always @(posedge sclk or posedge cs_n or negedge rst_n) begin",
-        "        if (!rst_n || cs_n) begin",
-        "            rx_shift  <= 16'd0;",
+        "    always @(posedge sclk or posedge spi_arst) begin",
+        "        if (spi_arst) begin",
+        "            rx_shift  <= 8'd0;",
         f"            bit_count <= {BCW}'d0;",
         "            rw_bit    <= 1'b0;",
         "            addr      <= 7'd0;",
@@ -443,8 +456,8 @@ def generate_verilog(registers, output_file):
         "",
         "            // Auto-increment address at each data byte boundary (bit_count==15,23,31...)",
         "            // bit_count[2:0]==7 picks out those boundaries.",
-        "            // Exclude bit_count==1023 (saturated): the 127th data byte boundary is",
-        "            // bit_count==1015, which is the last valid increment.",
+        "            // Exclude bit_count==1023 (saturated): last valid increment is at",
+        "            // bit_count==1015 (126th data byte boundary).",
         f"            if (bit_count >= {BCW}'d15 && bit_count < {BCW}'d1023 &&",
         "                bit_count[2:0] == 3'd7) begin",
         f"                if (addr < 7'd{MAX_ADDR})",
@@ -460,56 +473,54 @@ def generate_verilog(registers, output_file):
         "",
     ]
 
-    # -------------------------------------------------------------------------
-    # Write block
-    # Sensitivity: posedge sclk, negedge rst_n only.
-    # cs_n is a level gate inside the body — no async edge needed here because
-    # writes are committed mid-transaction, never at CS edges.
-    # -------------------------------------------------------------------------
-    v += [
+
+def _emit_write_block(registers: list) -> list:
+    lines = [
         "    //====================================================================",
         "    // Register Write Block",
         "    // Sensitivity: posedge sclk + negedge rst_n only (synthesizable 2-edge FF).",
         "    // CS gated by level: writes only occur while cs_n is asserted.",
-        "    // Write commits at every data byte boundary: bit_count==15, 23, 31, ...",
+        "    // Write commits at every data byte boundary: bit_count==15, 23, 31, ..., 1015",
+        "    // (up to 126 data bytes; the 127th is not committed due to counter saturation).",
         "    //====================================================================",
         "",
         "    always @(posedge sclk or negedge rst_n) begin",
         "        if (!rst_n) begin",
     ]
+
     for reg in registers:
         if any(f["type"] == "rw" for f in reg["fields"]):
-            reset_val = 0
-            for f in reg["fields"]:
-                if f["type"] == "rw":
-                    fval = _parse_reset_to_int(f["reset"])
-                    mask = (1 << (f["msb"] - f["lsb"] + 1)) - 1
-                    reset_val |= (fval & mask) << f["lsb"]
-            v.append(f"            {reg['name']}_reg <= 8'h{reset_val:02x};")
-    v += [
+            lines.append(f"            {reg['name']}_reg <= 8'h{_reg_reset_byte(reg):02x};")
+
+    lines += [
         "        end",
         "        else if (!cs_n) begin",
         f"            if (rw_bit && bit_count >= {BCW}'d15 && bit_count < {BCW}'d1023 &&",
         "                bit_count[2:0] == 3'd7) begin",
         "                case (addr)",
     ]
+
     for reg in registers:
-        if any(f["type"] == "rw" for f in reg["fields"]):
-            has_ro = any(f["type"] == "ro" for f in reg["fields"])
-            if has_ro:
-                # Mixed register: write only RW bits
-                v.append(f"                    7'h{reg['addr']:02x}: begin")
-                v.append(f"                        // Mixed RO/RW: only update RW bits")
-                for bit in range(8):
-                    for f in reg["fields"]:
-                        if f["type"] == "rw" and f["lsb"] <= bit <= f["msb"]:
-                            v.append(f"                        {reg['name']}_reg[{bit}] <= rx_next[{bit}];")
-                            break
-                v.append("                    end")
-            else:
-                # Pure RW: write full byte
-                v.append(f"                    7'h{reg['addr']:02x}: {reg['name']}_reg <= rx_next[7:0];")
-    v += [
+        if not any(f["type"] == "rw" for f in reg["fields"]):
+            continue
+        has_ro = any(f["type"] == "ro" for f in reg["fields"])
+        if has_ro:
+            lines.append(f"                    7'h{reg['addr']:02x}: begin")
+            lines.append( "                        // Mixed RO/RW: only update RW bits")
+            for bit in range(8):
+                for f in reg["fields"]:
+                    if f["type"] == "rw" and f["lsb"] <= bit <= f["msb"]:
+                        lines.append(
+                            f"                        {reg['name']}_reg[{bit}] <= rx_next[{bit}];"
+                        )
+                        break
+            lines.append("                    end")
+        else:
+            lines.append(
+                f"                    7'h{reg['addr']:02x}: {reg['name']}_reg <= rx_next;"
+            )
+
+    lines += [
         "                    default: ;",
         "                endcase",
         "            end",
@@ -517,22 +528,19 @@ def generate_verilog(registers, output_file):
         "    end",
         "",
     ]
+    return lines
 
-    # -------------------------------------------------------------------------
-    # TX block
-    # Sensitivity: negedge sclk, posedge cs_n (async reset), negedge rst_n.
-    # cs_n rising resets TX state — safe because MISO is an output; the master
-    # has already captured the last bit before cs_n rises (t_CSH requirement).
-    # -------------------------------------------------------------------------
-    v += [
+
+def _emit_tx_block() -> list:
+    return [
         "    //====================================================================",
         "    // SPI Transmit Block (Mode 0: change MISO on falling SCLK)",
-        "    // Async reset: posedge cs_n (safe — MISO is output, master has",
-        "    // already captured last bit before CS rises) or negedge rst_n.",
+        "    // Async reset: spi_arst (cs_n | ~rst_n) — true 2-edge FF.",
+        "    // Safe: MISO is output, master captures last bit before CS rises.",
         "    //====================================================================",
         "",
-        "    always @(negedge sclk or posedge cs_n or negedge rst_n) begin",
-        "        if (!rst_n || cs_n) begin",
+        "    always @(negedge sclk or posedge spi_arst) begin",
+        "        if (spi_arst) begin",
         "            miso      <= 1'b0;",
         "            tx_shift  <= 8'd0;",
         "            tx_active <= 1'b0;",
@@ -565,10 +573,9 @@ def generate_verilog(registers, output_file):
         "",
     ]
 
-    # -------------------------------------------------------------------------
-    # Output assignments
-    # -------------------------------------------------------------------------
-    v += [
+
+def _emit_output_assignments(rw_fields: list) -> list:
+    lines = [
         "    //====================================================================",
         "    // Output Assignments",
         "    //====================================================================",
@@ -577,30 +584,102 @@ def generate_verilog(registers, output_file):
     for f in rw_fields:
         sig_o = f"{f['reg_name']}_{f['name']}_o"
         if f["width"] == 1:
-            v.append(f"    assign {sig_o} = {f['reg_name']}_reg[{f['lsb']}];")
+            lines.append(f"    assign {sig_o} = {f['reg_name']}_reg[{f['lsb']}];")
         else:
-            v.append(f"    assign {sig_o} = {f['reg_name']}_reg[{f['msb']}:{f['lsb']}];")
-    v += ["", "endmodule"]
+            lines.append(f"    assign {sig_o} = {f['reg_name']}_reg[{f['msb']}:{f['lsb']}];")
+    lines += ["", "endmodule"]
+    return lines
+
+
+# =============================================================================
+# Top-level Verilog generation
+# =============================================================================
+
+def generate_verilog(registers: list, output_file: str) -> None:
+    """
+    Generate synthesizable SPI register interface.
+
+    Synthesizability strategy:
+      - Combined async reset: spi_arst = cs_n | ~rst_n (single gate).
+        All blocks needing both resets use this one signal → true 2-edge FF.
+      - Receive block:  clock=posedge sclk, async-reset=posedge spi_arst.
+                        Resets on CS deassert (end of transaction) or system reset.
+      - Write block:    clock=posedge sclk, async-reset=negedge rst_n only.
+                        CS gated by level (!cs_n) in body. Standard 2-edge FF.
+      - TX block:       clock=negedge sclk, async-reset=posedge spi_arst.
+                        Standard 2-edge FF.
+      - Synchronizers:  clock=posedge sclk, async-reset=negedge rst_n. Standard 2-edge FF.
+      No 3-edge sensitivity lists anywhere.
+
+    Read path timing:
+      addr is captured on posedge sclk at bit_count==7.
+      read_byte is combinational from addr.
+      TX block samples read_byte on negedge sclk at bit_count==8.
+      This gives one full SCLK half-period for addr->read_byte to settle.
+      Constrain: Tcomb(addr->read_byte) + Tsetup(TX FF) < T_sclk/2.
+    """
+    ro_fields = [f for reg in registers for f in reg["fields"] if f["type"] == "ro"]
+    rw_fields = [f for reg in registers for f in reg["fields"] if f["type"] == "rw"]
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    sections = [
+        # File header
+        [
+            "// Auto-generated SPI Register Interface",
+            f"// Generated by spireg.py on {timestamp}",
+            "// Verilog-2005 compatible, synthesizable (single clock + single async per block)",
+            "//",
+            "// Protocol: Variable-length transfers",
+            "//   Byte 0 : 1 RW bit + 7-bit address",
+            "//   Byte 1+: 8-bit data (address auto-increments after each byte)",
+            "//   Address saturates at 0x7F (no wrap); up to 126 data bytes per transfer",
+            "// Mode 0: CPOL=0, CPHA=0",
+            "//",
+            "// Reset / CS strategy:",
+            "//   rst_n    : async system reset, resets everything",
+            "//   spi_arst : combined async reset (cs_n | ~rst_n), used by receive and TX",
+            "//              blocks as a single async-reset edge (true 2-edge FF)",
+            "//   cs_n     : Write block uses cs_n as level gate only (not in sensitivity list)",
+            "//",
+            "// MISO: core drives MISO at all times; pad-ring should tri-state when cs_n=1",
+            "`timescale 1ns / 1ps",
+            "",
+        ],
+        _emit_module_header(ro_fields, rw_fields),
+        _emit_declarations(registers, ro_fields),
+        _emit_read_mux(registers),
+        _emit_receive_block(),
+        _emit_write_block(registers),
+        _emit_tx_block(),
+        _emit_output_assignments(rw_fields),
+    ]
+
+    lines = [line for section in sections for line in section]
 
     with open(output_file, "w") as fh:
-        fh.write("\n".join(v) + "\n")
+        fh.write("\n".join(lines) + "\n")
 
+    num_regs = len(registers)
     print(f"Generated: {output_file}")
     print(f"  Registers : {num_regs}")
     print(f"  RW fields : {len(rw_fields)}")
     print(f"  RO fields : {len(ro_fields)}")
-    print(f"  Addr width: {addr_width} bits (0x00-0x{MAX_ADDR:02X})")
-    print(f"  Data width: {data_width} bits")
-    print(f"  bit_count : {BCW} bits, max {1 << BCW} counts = {(1 << BCW) // 8} bytes")
+    print(f"  Addr width: {ADDR_WIDTH} bits (0x00-0x{MAX_ADDR:02X})")
+    print(f"  Data width: {DATA_WIDTH} bits")
+    print(f"  bit_count : {BCW} bits, max {(1 << BCW) // 8 - 2} data bytes per transfer")
 
+
+# =============================================================================
+# Entry point
+# =============================================================================
 
 def main():
     if len(sys.argv) != 3:
         print(f"Usage: {Path(sys.argv[0]).name} <input.csv> <output.v>")
         sys.exit(1)
 
-    csv_file = sys.argv[1]
-    output_file = sys.argv[2]
+    csv_file, output_file = sys.argv[1], sys.argv[2]
 
     if not Path(csv_file).exists():
         print(f"Error: '{csv_file}' not found", file=sys.stderr)
