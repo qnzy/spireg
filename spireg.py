@@ -198,7 +198,13 @@ def _parse_field(row: dict, reg_name: str) -> dict:
 def _validate_field_overlaps(registers: list) -> None:
     for reg in registers:
         used = [False] * 8
+        seen_names = set()
         for f in reg["fields"]:
+            if f["name"] in seen_names:
+                raise ValueError(
+                    f"Duplicate field name '{f['name']}' in register '{reg['name']}'"
+                )
+            seen_names.add(f["name"])
             for bit in range(f["lsb"], f["msb"] + 1):
                 if used[bit]:
                     raise ValueError(
