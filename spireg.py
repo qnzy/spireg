@@ -28,8 +28,15 @@ Synthesizability notes:
 - A combined reset wire (spi_arst = cs_n | ~rst_n) is used on receive and TX blocks,
   giving a true 2-edge sensitivity list (one clock + one async).
 - No 3-edge sensitivity lists are generated.
-- 2-FF synchronizers are clocked by SCLK. This limits metastability settling time to
-  one SCLK half-period when SCLK is toggling; use with care for very fast SCLK rates.
+- RO inputs pass through 2-FF synchronizers clocked by SCLK. Both stages are in
+  the same posedge block, so the settling budget for the first stage is one full
+  SCLK period minus the setup time of the second flop. Compute MTBF at the
+  maximum rated SCLK, not a typical one.
+- The synchronizers protect each bit independently. They do NOT make a multi-bit
+  RO field coherent: if the source changes near an SCLK edge, individual bits may
+  resolve differently and the read can return a value that never existed in the
+  source domain. Multi-bit RO inputs must be held stable for the duration of a
+  transaction (or be gray-coded / handshaked in the source domain).
   If RO inputs change only between transactions this is a non-issue.
 """
 
@@ -136,6 +143,7 @@ def parse_csv(csv_file: str) -> list:
         )
 
     _validate_field_overlaps(registers)
+    _check_generated_names(registers)
     _assign_addresses(registers)
     return registers
 
@@ -154,10 +162,10 @@ def _resolve_reg_name(row, current_reg, last_reg_name, seen_reg_names, registers
 
     if current_reg is None or current_reg["name"] != reg_name:
         if reg_name in seen_reg_names:
-            print(
-                f"Warning: register '{reg_name}' appears non-contiguously in CSV; "
-                "it will be assigned a new address (not merged with earlier occurrence).",
-                file=sys.stderr,
+            raise ValueError(
+                f"Register '{reg_name}' appears non-contiguously in the CSV. "
+                "All fields of a register must be on consecutive rows (continuation "
+                "rows have an empty reg_name). Merge the rows, or rename one of them."
             )
         if current_reg is not None:
             registers.append(current_reg)
@@ -244,6 +252,66 @@ def _validate_field_overlaps(registers: list) -> None:
                         f"Bit {bit} in register '{reg['name']}' is used by multiple fields"
                     )
                 used[bit] = True
+
+
+# Verilog-2005 keywords a flattened field name could collide with. The generated
+# suffixes (_o/_i/_reg/_sync1/_sync2) make this unlikely, but the check is free.
+_VERILOG_KEYWORDS = frozenset("""
+always and assign automatic begin buf bufif0 bufif1 case casex casez cell cmos
+config deassign default defparam design disable edge else end endcase endconfig
+endfunction endgenerate endmodule endprimitive endspecify endtable endtask event
+for force forever fork function generate genvar highz0 highz1 if ifnone incdir
+include initial inout input instance integer join large liblist library localparam
+macromodule medium module nand negedge nmos nor noshowcancelled not notif0 notif1
+or output parameter pmos posedge primitive pull0 pull1 pulldown pullup
+pulsestyle_ondetect pulsestyle_onevent rcmos real realtime reg release repeat
+rnmos rpmos rtran rtranif0 rtranif1 scalared showcancelled signed small specify
+specparam strong0 strong1 supply0 supply1 table task time tran tranif0 tranif1
+tri tri0 tri1 triand trior trireg unsigned use uwire vectored wait wand weak0
+weak1 while wire wor xnor xor
+""".split())
+
+
+def _check_generated_names(registers: list) -> None:
+    """Reject CSVs whose flattened names collide in the generated Verilog.
+
+    Field names are flattened to '{reg_name}_{field_name}' plus a suffix, so two
+    distinct fields can produce the same identifier -- e.g. register 'A_B' field
+    'C' and register 'A' field 'B_C' both give 'A_B_C'. That emits duplicate
+    port and reg declarations, which does not compile.
+
+    Every identifier the emitters produce is collected here rather than only the
+    port names, so adding a new generated signal later cannot silently reopen
+    this hole.
+    """
+    owners = {}          # identifier -> "REG.FIELD" that produced it
+    collisions = []
+
+    for reg in registers:
+        for f in reg["fields"]:
+            base = f"{reg['name']}_{f['name']}"
+            if base.lower() in _VERILOG_KEYWORDS:
+                raise ValueError(
+                    f"Flattened name '{base}' for {reg['name']}.{f['name']} "
+                    "is a Verilog keyword"
+                )
+            suffixes = ["_o", "_reg"] if f["type"] == "rw" else ["_i", "_sync1", "_sync2"]
+            for suffix in suffixes:
+                ident = base + suffix
+                origin = f"{reg['name']}.{f['name']}"
+                if ident in owners and owners[ident] != origin:
+                    collisions.append((ident, owners[ident], origin))
+                else:
+                    owners[ident] = origin
+
+    if collisions:
+        detail = "; ".join(
+            f"'{ident}' from both {a} and {b}" for ident, a, b in collisions
+        )
+        raise ValueError(
+            f"Flattened field names collide in the generated Verilog: {detail}. "
+            "Rename one of the registers or fields."
+        )
 
 
 def _assign_addresses(registers: list) -> None:
@@ -351,8 +419,16 @@ def _emit_declarations(registers: list, ro_fields: list) -> list:
         lines += [
             "    //====================================================================",
             "    // 2-FF Synchronizers for RO inputs",
-            "    // Clock: SCLK. Metastability settling time = 1 SCLK half-period.",
-            "    // Safe when RO inputs change only between transactions (SCLK idle).",
+            "    // Clock: SCLK. Both stages sit in the same posedge block, so the",
+            "    // first stage has one full SCLK period (minus the second flop's",
+            "    // setup time) to settle. Evaluate MTBF at the maximum rated SCLK.",
+            "    //",
+            "    // These synchronize each bit independently and do NOT guarantee",
+            "    // coherency across a multi-bit RO field: bits may resolve",
+            "    // differently and a read can return a value that never existed in",
+            "    // the source domain. Multi-bit RO inputs must be held stable for",
+            "    // the duration of a transaction; holding them stable between",
+            "    // transactions satisfies this trivially.",
             "    //====================================================================",
             "",
         ]
@@ -642,6 +718,9 @@ def generate_verilog(registers: list, output_file: str) -> None:
       - TX block:       clock=negedge sclk, async-reset=posedge spi_arst.
                         Standard 2-edge FF.
       - Synchronizers:  clock=posedge sclk, async-reset=negedge rst_n. Standard 2-edge FF.
+        Both stages are in one posedge block: the first stage gets a full SCLK
+        period to settle, not a half period. Per-bit only; see the coherency
+        note in the module header for multi-bit RO fields.
       No 3-edge sensitivity lists anywhere.
 
     Read path timing:
