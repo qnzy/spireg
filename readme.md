@@ -1,7 +1,7 @@
 **spireg**
 
 This is a small python script that generates an integrated SPI slave
-and register map. The register map is generated based on a CSV file.
+and register map in Verilog. The register map is generated based on a CSV file.
 
 See the script for basic documentation or the test case in the *test*
 folder.
