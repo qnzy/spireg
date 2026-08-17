@@ -1,105 +1,86 @@
-# Makefile for SPI Register Interface
-# Supports Icarus Verilog simulation
+# Makefile for the generated SPI register interface
+#
+#   make test    generate RTL, build, run the self-checking testbench
+#                (exits non-zero if any check fails -- safe for CI)
+#   make stress  same, but sweep several random seeds
+#   make waves   re-run with VCD dumping and open gtkwave
+#   make lint    Verilator lint (optional; skipped if not installed)
+#   make clean
 
-# Tools
-IVERILOG = iverilog
-VVP = vvp
-GTKWAVE = gtkwave
-PYTHON = python3
+IVERILOG    = iverilog
+VVP         = vvp
+GTKWAVE     = gtkwave
+VERILATOR   = verilator
+PYTHON      = python3
 
-# Verilog standard
 VERILOG_STD = -g2005
 
-# Source files
-CSV_FILE = registers.csv
-GENERATOR = ../spireg.py
-GENERATED_RTL = spi_reg_interface_generated.v
-TB = tb_spi_reg_interface.v
+CSV         = registers.csv
+GENERATOR   = ../spireg.py
+RTL         = spi_reg_interface.v
+TB          = tb_spireg.v
+SIM         = tb_spireg.out
+LOG         = tb_spireg.log
+VCD         = tb_spireg.vcd
 
-# Output files
-GEN_SIM = spi_gen_sim.out
-VCD_FILE = tb_spi_reg_interface.vcd
+SEED       ?= 0x12345678
+SEEDS      ?= 1 2 3 4 5 6 7 8
 
-# Phony targets
-.PHONY: all test_gen generate clean waves help
+.PHONY: all test stress generate waves lint clean help
 
-# Default target - test generated design
-all: test_gen
+all: test
 
-# Help target
 help:
-	@echo "SPI Register Interface Makefile"
-	@echo "================================"
+	@echo "make test    - build and run the self-checking testbench"
+	@echo "make stress  - run the testbench over several random seeds"
+	@echo "make waves   - re-run with VCD dumping and open gtkwave"
+	@echo "make lint    - Verilator lint of the generated RTL"
+	@echo "make clean   - remove generated files"
 	@echo ""
-	@echo "Design Options:"
-	@echo "  REFERENCE - Hand-written spi_reg_interface.v (for comparison)"
-	@echo "  GENERATED - Auto-generated from CSV by gen_regfile.py"
-	@echo ""
-	@echo "Targets:"
-	@echo "  all        - Generate and test design from CSV (default)"
-	@echo "  test_gen   - Test generated design"
-	@echo "  generate   - Generate Verilog from CSV"
-	@echo "  waves      - Open waveform viewer (GTKWave)"
-	@echo "  clean      - Remove generated files"
-	@echo "  help       - Show this help message"
-	@echo ""
-	@echo "Examples:"
-	@echo "  make              # Generate from CSV and test"
-	@echo "  make generate     # Only generate Verilog"
-	@echo ""
+	@echo "make test SEED=0xdeadbeef   - run one specific seed"
 
-# Generate Verilog from CSV
-generate: $(GENERATED_RTL)
+# The module name must match the file name to keep Verilator's DECLFILENAME
+# check quiet, so the generated RTL is written as spi_reg_interface.v.
+generate: $(RTL)
 
-$(GENERATED_RTL): $(CSV_FILE) $(GENERATOR)
-	@echo "Generating SPI register interface from $(CSV_FILE)..."
-	$(PYTHON) $(GENERATOR) $(CSV_FILE) $(GENERATED_RTL)
-	@echo ""
+$(RTL): $(CSV) $(GENERATOR)
+	$(PYTHON) $(GENERATOR) $(CSV) $(RTL)
 
-# Test generated design
-test_gen: $(GEN_SIM)
-	@echo "=========================================="
-	@echo "Testing GENERATED design"
-	@echo "=========================================="
-	@echo ""
-	$(VVP) $(GEN_SIM)
-	@echo ""
-	@echo "Simulation complete. Waveform: $(VCD_FILE)"
+$(SIM): $(RTL) $(TB)
+	$(IVERILOG) $(VERILOG_STD) -o $(SIM) $(RTL) $(TB)
 
-$(GEN_SIM): $(GENERATED_RTL) $(TB)
-	@echo "Compiling generated design..."
-	$(IVERILOG) $(VERILOG_STD) -o $(GEN_SIM) $(GENERATED_RTL) $(TB)
+# The testbench prints "RESULT: PASS" only when error_count is zero. Grepping
+# for the positive string (rather than for failures) also catches a simulator
+# crash or an early $finish, both of which must count as a failure.
+test: $(SIM)
+	@$(VVP) $(SIM) +seed=$(SEED) 2>&1 | tee $(LOG)
+	@grep -q "RESULT: PASS" $(LOG) || { echo ""; echo "*** TESTS FAILED ***"; exit 1; }
+	@echo "*** TESTS PASSED ***"
 
+stress: $(SIM)
+	@rc=0; \
+	for s in $(SEEDS); do \
+	    out=$$($(VVP) $(SIM) +seed=$$s 2>&1); \
+	    if echo "$$out" | grep -q "RESULT: PASS"; then \
+	        echo "seed $$s: PASS  ($$(echo "$$out" | grep -oE 'checks : [0-9]+'))"; \
+	    else \
+	        echo "seed $$s: FAIL"; \
+	        echo "$$out" | grep '\[FAIL\]' | head -5; \
+	        rc=1; \
+	    fi; \
+	done; \
+	exit $$rc
 
-# Open waveform viewer
-waves:
-	@echo "Opening waveform viewer..."
-	@if [ -f "$(VCD_FILE)" ]; then \
-		if command -v $(GTKWAVE) >/dev/null 2>&1; then \
-			$(GTKWAVE) $(VCD_FILE) & \
-		else \
-			echo "GTKWave not found. VCD file: $(VCD_FILE)"; \
-		fi \
-	else \
-		echo "No VCD file found. Run 'make' first."; \
-	fi
+waves: $(SIM)
+	$(VVP) $(SIM) +seed=$(SEED) +dump
+	@if command -v $(GTKWAVE) >/dev/null 2>&1; then $(GTKWAVE) $(VCD) & \
+	 else echo "gtkwave not found; VCD written to $(VCD)"; fi
 
-# Clean generated files
+lint: $(RTL)
+	@if command -v $(VERILATOR) >/dev/null 2>&1; then \
+	    $(VERILATOR) --lint-only -Wall $(RTL) --top-module spi_reg_interface && \
+	    echo "lint clean"; \
+	 else echo "verilator not installed; skipping"; fi
+
 clean:
-	@echo "Cleaning generated files..."
-	rm -f $(GEN_SIM)
-	rm -f $(GENERATED_RTL)
-	rm -f $(VCD_FILE)
-	rm -f *.vcd
-	@echo "Clean complete."
-
-# Check if tools are available
-check-tools:
-	@echo "Checking for required tools..."
-	@command -v $(IVERILOG) >/dev/null 2>&1 || { echo "ERROR: Icarus Verilog not found."; exit 1; }
-	@command -v $(VVP) >/dev/null 2>&1 || { echo "ERROR: VVP not found."; exit 1; }
-	@command -v $(PYTHON) >/dev/null 2>&1 || { echo "ERROR: Python3 not found."; exit 1; }
-	@echo "All required tools found."
-	@echo ""
-	@command -v $(GTKWAVE) >/dev/null 2>&1 && echo "Optional: GTKWave FOUND" || echo "Optional: GTKWave NOT FOUND"
-	@echo ""
+	rm -f $(SIM) $(RTL) $(LOG) $(VCD) *.out *.vcd

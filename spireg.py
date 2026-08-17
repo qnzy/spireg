@@ -9,8 +9,9 @@ SPI protocol:
 - Byte 1+: 8-bit data (write data or dummy for read)
 - rw: 1 for write, 0 for read
 - Multi-byte transfers: address auto-increments after each data byte
-- Address saturates at 0x7F (does NOT wrap to 0x00)
-- Maximum transfer: 127 bytes (1 command + 126 data bytes)
+- Burst length is unbounded; the address stops at the last implemented
+  register and further bytes in the same transfer are discarded (addr_sat):
+  writes are not committed and reads return 0x00.
 - Mode 0: CPOL=0, CPHA=0
 
 CSV format:
@@ -19,6 +20,8 @@ CSV format:
 - reg_name can be empty to reuse from the previous line.
 - type can be rw (read/write) or ro (read only)
 - rw creates output from the regmap, ro generates input to the regmap
+- reset applies to rw fields only and must fit the field width; an ro field
+  is driven by its input port, so its reset column must be empty or 0
 
 Synthesizability notes:
 - All always blocks use at most one clock edge plus one async reset.
@@ -42,8 +45,7 @@ _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 MAX_REGS = 128   # 7-bit address space
 ADDR_WIDTH = 7
 DATA_WIDTH = 8
-BCW = 10         # bit_count width: 0..1023, covers 1 cmd byte + 126 data bytes
-MAX_ADDR = 127   # saturate here, no wrap
+MAX_ADDR = 127   # top of the 7-bit address space
 
 
 # =============================================================================
@@ -67,18 +69,27 @@ def _parse_int(s: str) -> int:
     return int(s, 10)
 
 
-def _reg_reset_byte(reg: dict) -> int:
-    """Compute the reset value byte for the RW portion of a register."""
-    value = 0
-    for f in reg["fields"]:
-        if f["type"] == "rw":
-            mask = (1 << f["width"]) - 1
-            value |= (_parse_int(f["reset"]) & mask) << f["lsb"]
-    return value
-
-
 def _zero_literal(width: int) -> str:
     return "1'b0" if width == 1 else f"{width}'d0"
+
+
+def _field_reg(f: dict) -> str:
+    """Storage element name for a RW field."""
+    return f"{f['reg_name']}_{f['name']}_reg"
+
+
+def _reset_literal(f: dict) -> str:
+    """Width-sized reset literal for a RW field, truncated to the field width."""
+    mask = (1 << f["width"]) - 1
+    value = _parse_int(f["reset"]) & mask
+    if f["width"] == 1:
+        return f"1'b{value}"
+    return f"{f['width']}'h{value:0{(f['width'] + 3) // 4}x}"
+
+
+def _bit_slice(name: str, msb: int, lsb: int) -> str:
+    """Index or slice expression, collapsing a 1-bit slice to a single index."""
+    return f"{name}[{msb}]" if msb == lsb else f"{name}[{msb}:{lsb}]"
 
 
 def _port_width(width: int) -> str:
@@ -176,13 +187,35 @@ def _parse_field(row: dict, reg_name: str) -> dict:
         raise ValueError(f"Invalid bit range [{msb}:{lsb}] for {reg_name}.{field_name}")
 
     width = msb - lsb + 1
-    reset_int = _parse_int(reset_str)
+
+    try:
+        reset_int = _parse_int(reset_str)
+    except ValueError:
+        raise ValueError(
+            f"Invalid reset value {reset_str!r} for {reg_name}.{field_name}"
+        )
+
+    if reset_int < 0:
+        raise ValueError(
+            f"Negative reset value {reset_str!r} for {reg_name}.{field_name}"
+        )
+
     field_max = (1 << width) - 1
     if reset_int > field_max:
-        print(
-            f"Warning: reset value {reset_str!r} for {reg_name}.{field_name} "
-            f"exceeds field width ({width} bits, max {field_max}); value will be truncated.",
-            file=sys.stderr,
+        raise ValueError(
+            f"Reset value {reset_str!r} for {reg_name}.{field_name} does not fit the "
+            f"field ({width} bits, max 0x{field_max:x})"
+        )
+
+    # An 'ro' field is driven by an input port, so its reset column is never
+    # used. Silently ignoring a value there would let a CSV that reads as
+    # "hardwire this constant" generate an input port instead.
+    if field_type == "ro" and reset_int != 0:
+        raise ValueError(
+            f"Reset value {reset_str!r} on read-only field {reg_name}.{field_name} "
+            f"has no effect: 'ro' fields are driven by the "
+            f"{reg_name}_{field_name}_i input port, not by stored state. "
+            f"Use 0 or leave the column empty."
         )
 
     return {
@@ -284,10 +317,12 @@ def _emit_declarations(registers: list, ro_fields: list) -> list:
         "    //====================================================================",
         "",
         "    // SPI framing state",
-        "    reg [7:0]           rx_shift;   // 1-byte shift register",
-        f"    reg [{BCW-1}:0]         bit_count;  // {BCW}-bit counter, saturates at {(1<<BCW)-1}",
+        "    reg [6:0]           rx_shift;   // 7-bit shift register (bit 7 never needed)",
+        "    reg [2:0]           bit_idx;    // free-running bit index within the byte",
+        "    reg                 cmd_done;   // set at the end of byte 0 (addr captured)",
         "    reg                 rw_bit;     // captured R/W bit from byte 0",
         "    reg [6:0]           addr;       // captured 7-bit register address",
+        "    reg                 addr_sat;   // increment ran past the last register",
         "",
         "    // TX path",
         "    reg [7:0]           tx_shift;",
@@ -296,18 +331,21 @@ def _emit_declarations(registers: list, ro_fields: list) -> list:
         "    // Combinational read data (registered name kept for clarity)",
         "    reg [7:0]           read_byte;  // driven by always@*, not a flop",
         "",
-        "    wire [7:0] rx_next = {rx_shift[6:0], mosi};",
+        "    wire [7:0] rx_next = {rx_shift, mosi};",
         "",
         "    // Combined async reset: cs_n deassert OR system reset (true 2-edge FF)",
         "    wire spi_arst = cs_n | ~rst_n;",
         "",
     ]
 
-    lines.append("    // RW register storage")
-    for reg in registers:
-        if any(f["type"] == "rw" for f in reg["fields"]):
-            lines.append(f"    reg [7:0] {reg['name']}_reg;")
-    lines.append("")
+    rw_fields = [f for reg in registers for f in reg["fields"] if f["type"] == "rw"]
+    if rw_fields:
+        lines.append("    // RW field storage (each reg is exactly the field width;")
+        lines.append("    // RO bits of a mixed register have no storage at all)")
+        for f in rw_fields:
+            w = f"[{f['width'] - 1}:0] " if f["width"] > 1 else ""
+            lines.append(f"    reg {w}{_field_reg(f)};")
+        lines.append("")
 
     if ro_fields:
         lines += [
@@ -349,18 +387,18 @@ def _build_read_mux_segments(reg: dict) -> list:
     that make up read_byte, MSB-first, for use in a concatenation.
     """
     # Build per-bit owner table
-    # RW bits  -> "REGNAME_reg:N"   (N = register bit index)
-    # RO 1-bit -> "signame"          (bare, no index)
-    # RO N-bit -> "signame:N"        (N = field-relative bit index)
-    # Unused   -> "1'b0"
+    # 1-bit field -> "signame"      (bare, no index)
+    # N-bit field -> "signame:N"     (N = field-relative bit index)
+    # Unused bit  -> "1'b0"
     bit_owner = ["1'b0"] * 8
     for f in reg["fields"]:
         for bit in range(f["lsb"], f["msb"] + 1):
-            if f["type"] == "ro":
-                sig = f"{reg['name']}_{f['name']}_sync2"
-                bit_owner[bit] = sig if f["width"] == 1 else f"{sig}:{bit - f['lsb']}"
-            else:
-                bit_owner[bit] = f"{reg['name']}_reg:{bit}"
+            sig = (
+                f"{reg['name']}_{f['name']}_sync2"
+                if f["type"] == "ro"
+                else _field_reg(f)
+            )
+            bit_owner[bit] = sig if f["width"] == 1 else f"{sig}:{bit - f['lsb']}"
 
     # Collapse runs of identical base signal into slices (scan MSB-first)
     segments = []
@@ -404,76 +442,77 @@ def _emit_read_mux(registers: list) -> list:
         "    //====================================================================",
         "    // Combinational Read Mux",
         "    // read_byte is valid one combinational delay after addr is updated.",
-        "    // TX block samples it on negedge sclk at bit_count==8, giving one",
-        "    // full half-period (posedge bit7 -> negedge bit8) to settle.",
+        "    // TX block samples it on the negedge that starts each data byte,",
+        "    // giving one full SCLK half-period for addr -> read_byte to settle.",
+        "    // Gated by addr_sat so a burst that runs past the last register reads",
+        "    // back 0x00 rather than repeating the last register's contents.",
         "    //====================================================================",
         "",
         "    always @* begin",
         "        read_byte = 8'h00;",
-        "        case (addr)",
+        "        if (!addr_sat) begin",
+        "            case (addr)",
     ]
 
     for reg in registers:
         segments = _build_read_mux_segments(reg)
         joined = ", ".join(segments)
-        prefix = f"            7'h{reg['addr']:02x}: read_byte = {{"
+        prefix = f"                7'h{reg['addr']:02x}: read_byte = {{"
         if len(prefix) + len(joined) + 2 <= 80:
             lines.append(f"{prefix}{joined}}};")
         else:
             lines.append(prefix)
             for i, seg in enumerate(segments):
                 comma = "," if i < len(segments) - 1 else ""
-                lines.append(f"                {seg}{comma}")
-            lines.append("            };")
+                lines.append(f"                    {seg}{comma}")
+            lines.append("                };")
 
     lines += [
-        "            default: read_byte = 8'h00;",
-        "        endcase",
+        "                default: read_byte = 8'h00;",
+        "            endcase",
+        "        end",
         "    end",
         "",
     ]
     return lines
 
 
-def _emit_receive_block() -> list:
+def _emit_receive_block(last_addr: int) -> list:
     return [
         "    //====================================================================",
         "    // SPI Receive Block (Mode 0: sample MOSI on rising SCLK)",
-        "    // Async reset: spi_arst (cs_n | ~rst_n) — true 2-edge FF.",
-        "    // Resets framing state when CS deasserts so the next transaction",
-        "    // always starts from a known state.",
+        "    // Async reset: spi_arst (cs_n | ~rst_n) - true 2-edge FF.",
         "    //====================================================================",
         "",
         "    always @(posedge sclk or posedge spi_arst) begin",
         "        if (spi_arst) begin",
-        "            rx_shift  <= 8'd0;",
-        f"            bit_count <= {BCW}'d0;",
-        "            rw_bit    <= 1'b0;",
-        "            addr      <= 7'd0;",
+        "            rx_shift <= 7'd0;",
+        "            bit_idx  <= 3'd0;",
+        "            cmd_done <= 1'b0;",
+        "            rw_bit   <= 1'b0;",
+        "            addr     <= 7'd0;",
+        "            addr_sat <= 1'b0;",
         "        end",
         "        else begin",
-        "            // Capture RW bit on the first rising edge",
-        f"            if (bit_count == {BCW}'d0)",
+        "            // First bit of byte 0 is the R/W bit",
+        "            if (!cmd_done && bit_idx == 3'd0)",
         "                rw_bit <= mosi;",
         "",
-        "            // Capture address after 8 clocks (bit_count==7: rx_next holds full byte 0)",
-        f"            if (bit_count == {BCW}'d7)",
-        "                addr <= rx_next[6:0];",
-        "",
-        "            // Auto-increment address at each data byte boundary (bit_count==15,23,31...)",
-        "            // bit_count[2:0]==7 picks out those boundaries.",
-        "            // Exclude bit_count==1023 (saturated): last valid increment is at",
-        "            // bit_count==1015 (126th data byte boundary).",
-        f"            if (bit_count >= {BCW}'d15 && bit_count < {BCW}'d1023 &&",
-        "                bit_count[2:0] == 3'd7) begin",
-        f"                if (addr < 7'd{MAX_ADDR})",
+        "            if (bit_idx == 3'd7) begin",
+        "                cmd_done <= 1'b1;",
+        "                if (!cmd_done)",
+        "                    addr <= rx_next[6:0];     // end of command byte",
+        f"                else if (addr >= 7'h{last_addr:02x})",
+        "                    addr_sat <= 1'b1;          // at or past the last register;",
+        "                                               // >= (not ==) so a burst starting",
+        "                                               // above the map cannot step over",
+        "                                               // the check and wrap to 0x00",
+        "                else",
         "                    addr <= addr + 7'd1;",
         "            end",
         "",
-        "            // Shift register and saturating bit counter",
-        "            rx_shift <= rx_next;",
-        f"            if (bit_count < {BCW}'d{(1 << BCW) - 1})",
-        f"                bit_count <= bit_count + {BCW}'d1;",
+        "            rx_shift <= rx_next[6:0];",
+        "            bit_idx  <= bit_idx + 3'd1;",
         "        end",
         "    end",
         "",
@@ -486,45 +525,47 @@ def _emit_write_block(registers: list) -> list:
         "    // Register Write Block",
         "    // Sensitivity: posedge sclk + negedge rst_n only (synthesizable 2-edge FF).",
         "    // CS gated by level: writes only occur while cs_n is asserted.",
-        "    // Write commits at every data byte boundary: bit_count==15, 23, 31, ..., 1015",
-        "    // (up to 126 data bytes; the 127th is not committed due to counter saturation).",
+        "    // Write commits at every data byte boundary (bit_idx==7, cmd_done set).",
+        "    // addr_sat blocks commits once the address has run past the last register,",
+        "    // so an overlong burst is discarded instead of repeatedly hitting the top.",
+        "    // RO bits of a mixed register have no storage, so no write masking needed.",
         "    //====================================================================",
         "",
         "    always @(posedge sclk or negedge rst_n) begin",
         "        if (!rst_n) begin",
     ]
 
-    for reg in registers:
-        if any(f["type"] == "rw" for f in reg["fields"]):
-            lines.append(f"            {reg['name']}_reg <= 8'h{_reg_reset_byte(reg):02x};")
+    rw_fields = [f for reg in registers for f in reg["fields"] if f["type"] == "rw"]
+    pad = max((len(_field_reg(f)) for f in rw_fields), default=0)
+    for f in rw_fields:
+        lines.append(f"            {_field_reg(f):<{pad}} <= {_reset_literal(f)};")
 
     lines += [
         "        end",
         "        else if (!cs_n) begin",
-        f"            if (rw_bit && bit_count >= {BCW}'d15 && bit_count < {BCW}'d1023 &&",
-        "                bit_count[2:0] == 3'd7) begin",
+        "            if (rw_bit && cmd_done && bit_idx == 3'd7 && !addr_sat) begin",
         "                case (addr)",
     ]
 
     for reg in registers:
-        if not any(f["type"] == "rw" for f in reg["fields"]):
+        writable = [f for f in reg["fields"] if f["type"] == "rw"]
+        if not writable:
             continue
-        has_ro = any(f["type"] == "ro" for f in reg["fields"])
-        if has_ro:
-            lines.append(f"                    7'h{reg['addr']:02x}: begin")
-            lines.append( "                        // Mixed RO/RW: only update RW bits")
-            for bit in range(8):
-                for f in reg["fields"]:
-                    if f["type"] == "rw" and f["lsb"] <= bit <= f["msb"]:
-                        lines.append(
-                            f"                        {reg['name']}_reg[{bit}] <= rx_next[{bit}];"
-                        )
-                        break
-            lines.append("                    end")
-        else:
+        if len(writable) == 1:
+            f = writable[0]
             lines.append(
-                f"                    7'h{reg['addr']:02x}: {reg['name']}_reg <= rx_next;"
+                f"                    7'h{reg['addr']:02x}: {_field_reg(f)} <= "
+                f"{_bit_slice('rx_next', f['msb'], f['lsb'])};"
             )
+        else:
+            pad = max(len(_field_reg(f)) for f in writable)
+            lines.append(f"                    7'h{reg['addr']:02x}: begin")
+            for f in writable:
+                lines.append(
+                    f"                        {_field_reg(f):<{pad}} <= "
+                    f"{_bit_slice('rx_next', f['msb'], f['lsb'])};"
+                )
+            lines.append("                    end")
 
     lines += [
         "                    default: ;",
@@ -541,8 +582,8 @@ def _emit_tx_block() -> list:
     return [
         "    //====================================================================",
         "    // SPI Transmit Block (Mode 0: change MISO on falling SCLK)",
-        "    // Async reset: spi_arst (cs_n | ~rst_n) — true 2-edge FF.",
-        "    // Safe: MISO is output, master captures last bit before CS rises.",
+        "    // Loads a fresh read_byte on the falling edge that starts each data",
+        "    // byte (bit_idx==0 with the command byte already consumed).",
         "    //====================================================================",
         "",
         "    always @(negedge sclk or posedge spi_arst) begin",
@@ -551,29 +592,17 @@ def _emit_tx_block() -> list:
         "            tx_shift  <= 8'd0;",
         "            tx_active <= 1'b0;",
         "        end",
+        "        else if (!rw_bit && cmd_done && bit_idx == 3'd0) begin",
+        "            miso      <= read_byte[7];",
+        "            tx_shift  <= {read_byte[6:0], 1'b0};",
+        "            tx_active <= 1'b1;",
+        "        end",
+        "        else if (tx_active) begin",
+        "            miso     <= tx_shift[7];",
+        "            tx_shift <= {tx_shift[6:0], 1'b0};",
+        "        end",
         "        else begin",
-        "            // At bit_count==8 (8th falling edge after CS), addr is stable",
-        "            // and read_byte is valid. Load first read byte.",
-        f"            if (!rw_bit && bit_count == {BCW}'d8) begin",
-        "                miso      <= read_byte[7];",
-        "                tx_shift  <= {read_byte[6:0], 1'b0};",
-        "                tx_active <= 1'b1;",
-        "            end",
-        "            // Reload at subsequent byte boundaries (bit_count==16,24,...)",
-        "            // bit_count[2:0]==0 on negedge after each full data byte.",
-        f"            else if (!rw_bit && tx_active &&",
-        f"                     bit_count >= {BCW}'d16 && bit_count <= {BCW}'d1023 &&",
-        "                     bit_count[2:0] == 3'd0) begin",
-        "                miso     <= read_byte[7];",
-        "                tx_shift <= {read_byte[6:0], 1'b0};",
-        "            end",
-        "            else if (tx_active) begin",
-        "                miso     <= tx_shift[7];",
-        "                tx_shift <= {tx_shift[6:0], 1'b0};",
-        "            end",
-        "            else begin",
-        "                miso <= 1'b0;",
-        "            end",
+        "            miso <= 1'b0;",
         "        end",
         "    end",
         "",
@@ -587,12 +616,10 @@ def _emit_output_assignments(rw_fields: list) -> list:
         "    //====================================================================",
         "",
     ]
+    pad = max((len(f"{f['reg_name']}_{f['name']}_o") for f in rw_fields), default=0)
     for f in rw_fields:
         sig_o = f"{f['reg_name']}_{f['name']}_o"
-        if f["width"] == 1:
-            lines.append(f"    assign {sig_o} = {f['reg_name']}_reg[{f['lsb']}];")
-        else:
-            lines.append(f"    assign {sig_o} = {f['reg_name']}_reg[{f['msb']}:{f['lsb']}];")
+        lines.append(f"    assign {sig_o:<{pad}} = {_field_reg(f)};")
     lines += ["", "endmodule"]
     return lines
 
@@ -618,10 +645,12 @@ def generate_verilog(registers: list, output_file: str) -> None:
       No 3-edge sensitivity lists anywhere.
 
     Read path timing:
-      addr is captured on posedge sclk at bit_count==7.
+      addr is captured/incremented on posedge sclk at bit_idx==7.
       read_byte is combinational from addr.
-      TX block samples read_byte on negedge sclk at bit_count==8.
+      TX block samples read_byte on the following negedge (bit_idx==0).
       This gives one full SCLK half-period for addr->read_byte to settle.
+      NOTE: this is a half-cycle path through the whole read mux; it is the
+      critical path and it scales with the number of registers.
       Constrain: Tcomb(addr->read_byte) + Tsetup(TX FF) < T_sclk/2.
     """
     ro_fields = [f for reg in registers for f in reg["fields"] if f["type"] == "ro"]
@@ -639,7 +668,8 @@ def generate_verilog(registers: list, output_file: str) -> None:
             "// Protocol: Variable-length transfers",
             "//   Byte 0 : 1 RW bit + 7-bit address",
             "//   Byte 1+: 8-bit data (address auto-increments after each byte)",
-            "//   Address saturates at 0x7F (no wrap); up to 126 data bytes per transfer",
+            "//   Burst length unbounded; past the last register writes are dropped and",
+            "//   reads return 0x00 (addr_sat)",
             "// Mode 0: CPOL=0, CPHA=0",
             "//",
             "// Reset / CS strategy:",
@@ -655,7 +685,7 @@ def generate_verilog(registers: list, output_file: str) -> None:
         _emit_module_header(ro_fields, rw_fields),
         _emit_declarations(registers, ro_fields),
         _emit_read_mux(registers),
-        _emit_receive_block(),
+        _emit_receive_block(registers[-1]["addr"]),
         _emit_write_block(registers),
         _emit_tx_block(),
         _emit_output_assignments(rw_fields),
@@ -673,7 +703,7 @@ def generate_verilog(registers: list, output_file: str) -> None:
     print(f"  RO fields : {len(ro_fields)}")
     print(f"  Addr width: {ADDR_WIDTH} bits (0x00-0x{MAX_ADDR:02X})")
     print(f"  Data width: {DATA_WIDTH} bits")
-    print(f"  bit_count : {BCW} bits, max {(1 << BCW) // 8 - 2} data bytes per transfer")
+    print(f"  Burst     : unbounded; writes stop past 0x{registers[-1]['addr']:02X}")
 
 
 # =============================================================================
