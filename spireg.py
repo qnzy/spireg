@@ -13,9 +13,30 @@ SPI protocol:
   register and further bytes in the same transfer are discarded (addr_sat):
   writes are not committed and reads return 0x00.
 - Mode 0: CPOL=0, CPHA=0
+- CS framing is mandatory: every transaction must be bracketed by cs_n
+  falling/rising. cs_n tied low is not supported.
+- If rst_n is asserted while cs_n is low, the remainder of that frame is
+  ignored (MISO low, no writes). The next frame works normally.
+
+Limitations (by design, to keep the interface simple):
+- No frame-length check and no CRC. SCLK must be glitch-free: a spurious or
+  missing edge misaligns the frame and can commit a wrong write. Verify
+  critical writes by reading them back.
+- Each register is written at the SCLK edge that completes its data byte.
+  A value spread over several registers therefore passes through
+  intermediate states (for one byte time within a burst, indefinitely
+  across separate transactions). If that matters, keep the consumer
+  disabled while updating.
+- RW outputs change on SCLK edges, asynchronously to any other clock.
+  Consumers in another clock domain must synchronize them, and multi-bit
+  fields need the same coherency care as RO inputs (see below).
+- Only rw and ro fields. Sticky / write-1-to-clear / interrupt fields are not
+  possible without a system clock, since the events occur while SCLK is idle.
 
 CSV format:
+- Comma-delimited, ASCII/UTF-8 without byte-order mark.
 - First line must contain (in any order): reg_name,field_name,lsb,msb,type,reset
+  (additional columns, e.g. a description, are allowed and ignored)
 - Following lines define register fields.
 - reg_name can be empty to reuse from the previous line.
 - type can be rw (read/write) or ro (read only)
@@ -25,8 +46,11 @@ CSV format:
 
 Synthesizability notes:
 - All always blocks use at most one clock edge plus one async reset.
-- A combined reset wire (spi_arst = cs_n | ~rst_n) is used on receive and TX blocks,
-  giving a true 2-edge sensitivity list (one clock + one async).
+- A combined reset wire (spi_arst = cs_n | ~rst_n | ~armed) is used on receive and
+  TX blocks, giving a true 2-edge sensitivity list (one clock + one async).
+- 'armed' is a single flop clocked by the falling edge of cs_n (set) with
+  async reset rst_n. cs_n is therefore a clock for this one flop (relevant
+  for STA and scan insertion).
 - No 3-edge sensitivity lists are generated.
 - RO inputs pass through 2-FF synchronizers clocked by SCLK. Both stages are in
   the same posedge block, so the settling budget for the first stage is one full
@@ -41,9 +65,9 @@ Synthesizability notes:
 """
 
 import csv
+import hashlib
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
 # Valid Verilog-2005 identifier: starts with letter or underscore, rest alphanumeric/_
@@ -115,26 +139,36 @@ def parse_csv(csv_file: str) -> list:
     """
     registers = []
 
-    with open(csv_file, "r") as fh:
+    # newline="" as required by the csv module docs; explicit encoding so a
+    # BOM shows up as U+FEFF on every platform and is reported, not misparsed.
+    with open(csv_file, "r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
-
-        required = {"reg_name", "field_name", "lsb", "msb", "type", "reset"}
-        if not required.issubset(set(reader.fieldnames or [])):
-            raise ValueError(f"CSV must contain columns: {required}")
 
         current_reg = None
         last_reg_name = None
         seen_reg_names = {}
 
-        for row in reader:
-            reg_name, current_reg, last_reg_name = _resolve_reg_name(
-                row, current_reg, last_reg_name, seen_reg_names, registers
-            )
-            field = _parse_field(row, reg_name)
-            current_reg["fields"].append(field)
+        try:
+            _check_header(reader.fieldnames)
+            for row in reader:
+                try:
+                    if None in row:
+                        raise ValueError("row has more columns than the header")
+                    reg_name, current_reg, last_reg_name = _resolve_reg_name(
+                        row, current_reg, last_reg_name, seen_reg_names, registers
+                    )
+                    field = _parse_field(row, reg_name)
+                except ValueError as e:
+                    raise ValueError(f"{csv_file}, line {reader.line_num}: {e}") from None
+                current_reg["fields"].append(field)
+        except UnicodeDecodeError:
+            raise ValueError(
+                f"{csv_file} is not valid UTF-8/ASCII text"
+            ) from None
 
-        if current_reg is not None:
-            registers.append(current_reg)
+        if current_reg is None:
+            raise ValueError(f"{csv_file} has a header but no register rows")
+        registers.append(current_reg)
 
     if len(registers) > MAX_REGS:
         raise ValueError(
@@ -146,6 +180,49 @@ def parse_csv(csv_file: str) -> list:
     _check_generated_names(registers)
     _assign_addresses(registers)
     return registers
+
+
+REQUIRED_COLUMNS = ("reg_name", "field_name", "lsb", "msb", "type", "reset")
+
+
+def _check_header(fieldnames) -> None:
+    """Reject malformed headers with a message that says what is wrong."""
+    if not fieldnames:
+        raise ValueError("CSV file is empty (no header line)")
+    found = list(fieldnames)
+    if found[0].startswith("\ufeff"):
+        raise ValueError(
+            "CSV file starts with a UTF-8 byte-order mark (e.g. Excel's "
+            "'CSV UTF-8' export). Save it as plain CSV without BOM."
+        )
+    if len(found) == 1 and (";" in found[0] or "\t" in found[0]):
+        raise ValueError(
+            f"Header is a single column {found[0]!r}: the file appears to use "
+            "';' or tab as delimiter. The delimiter must be ','."
+        )
+    padded = [n for n in found if n is not None and n != n.strip()]
+    if padded:
+        raise ValueError(
+            f"Column names must not have leading/trailing whitespace: {padded}"
+        )
+    missing = [c for c in REQUIRED_COLUMNS if c not in found]
+    if missing:
+        raise ValueError(
+            f"CSV header is missing column(s) {missing}. "
+            f"Found: {found}. Required: {list(REQUIRED_COLUMNS)}"
+        )
+
+
+def _parse_bit_index(row: dict, col: str, where: str) -> int:
+    s = (row.get(col) or "").strip()
+    if not s:
+        raise ValueError(f"'{col}' is empty for {where}")
+    try:
+        return int(s, 10)
+    except ValueError:
+        raise ValueError(
+            f"Invalid '{col}' value {s!r} for {where} (decimal bit index expected)"
+        ) from None
 
 
 def _resolve_reg_name(row, current_reg, last_reg_name, seen_reg_names, registers):
@@ -182,8 +259,9 @@ def _parse_field(row: dict, reg_name: str) -> dict:
         raise ValueError(f"field_name is empty in register '{reg_name}'")
     _check_identifier(field_name, f"register '{reg_name}'")
 
-    lsb = int(row["lsb"])
-    msb = int(row["msb"])
+    where = f"{reg_name}.{field_name}"
+    lsb = _parse_bit_index(row, "lsb", where)
+    msb = _parse_bit_index(row, "msb", where)
     field_type = (row.get("type") or "").strip().lower()
     reset_str = (row.get("reset") or "").strip()
 
@@ -254,24 +332,6 @@ def _validate_field_overlaps(registers: list) -> None:
                 used[bit] = True
 
 
-# Verilog-2005 keywords a flattened field name could collide with. The generated
-# suffixes (_o/_i/_reg/_sync1/_sync2) make this unlikely, but the check is free.
-_VERILOG_KEYWORDS = frozenset("""
-always and assign automatic begin buf bufif0 bufif1 case casex casez cell cmos
-config deassign default defparam design disable edge else end endcase endconfig
-endfunction endgenerate endmodule endprimitive endspecify endtable endtask event
-for force forever fork function generate genvar highz0 highz1 if ifnone incdir
-include initial inout input instance integer join large liblist library localparam
-macromodule medium module nand negedge nmos nor noshowcancelled not notif0 notif1
-or output parameter pmos posedge primitive pull0 pull1 pulldown pullup
-pulsestyle_ondetect pulsestyle_onevent rcmos real realtime reg release repeat
-rnmos rpmos rtran rtranif0 rtranif1 scalared showcancelled signed small specify
-specparam strong0 strong1 supply0 supply1 table task time tran tranif0 tranif1
-tri tri0 tri1 triand trior trireg unsigned use uwire vectored wait wand weak0
-weak1 while wire wor xnor xor
-""".split())
-
-
 def _check_generated_names(registers: list) -> None:
     """Reject CSVs whose flattened names collide in the generated Verilog.
 
@@ -283,6 +343,10 @@ def _check_generated_names(registers: list) -> None:
     Every identifier the emitters produce is collected here rather than only the
     port names, so adding a new generated signal later cannot silently reopen
     this hole.
+
+    No keyword or internal-signal check is needed: every generated identifier
+    ends in _o/_reg/_i/_sync1/_sync2, which no Verilog keyword and no internal
+    signal of the module does.
     """
     owners = {}          # identifier -> "REG.FIELD" that produced it
     collisions = []
@@ -290,11 +354,6 @@ def _check_generated_names(registers: list) -> None:
     for reg in registers:
         for f in reg["fields"]:
             base = f"{reg['name']}_{f['name']}"
-            if base.lower() in _VERILOG_KEYWORDS:
-                raise ValueError(
-                    f"Flattened name '{base}' for {reg['name']}.{f['name']} "
-                    "is a Verilog keyword"
-                )
             suffixes = ["_o", "_reg"] if f["type"] == "rw" else ["_i", "_sync1", "_sync2"]
             for suffix in suffixes:
                 ident = base + suffix
@@ -378,14 +437,24 @@ def _emit_module_header(ro_fields: list, rw_fields: list) -> list:
     return lines
 
 
+def _rx_width(registers: list) -> int:
+    """Width of rx_next: 8 if any RW field uses bit 7, else 7 (the address
+    capture needs [6:0]). Sizing it to what is used keeps lint clean."""
+    uses_bit7 = any(
+        f["type"] == "rw" and f["msb"] == 7 for reg in registers for f in reg["fields"]
+    )
+    return 8 if uses_bit7 else 7
+
+
 def _emit_declarations(registers: list, ro_fields: list) -> list:
+    rx_w = _rx_width(registers)
     lines = [
         "    //====================================================================",
         "    // Internal Declarations",
         "    //====================================================================",
         "",
         "    // SPI framing state",
-        "    reg [6:0]           rx_shift;   // 7-bit shift register (bit 7 never needed)",
+        f"    reg [{rx_w - 2}:0]           rx_shift;   // MOSI history; rx_next = {{rx_shift, mosi}}",
         "    reg [2:0]           bit_idx;    // free-running bit index within the byte",
         "    reg                 cmd_done;   // set at the end of byte 0 (addr captured)",
         "    reg                 rw_bit;     // captured R/W bit from byte 0",
@@ -399,10 +468,23 @@ def _emit_declarations(registers: list, ro_fields: list) -> list:
         "    // Combinational read data (registered name kept for clarity)",
         "    reg [7:0]           read_byte;  // driven by always@*, not a flop",
         "",
-        "    wire [7:0] rx_next = {rx_shift, mosi};",
+        f"    wire [{rx_w - 1}:0] rx_next = {{rx_shift, mosi}};",
         "",
-        "    // Combined async reset: cs_n deassert OR system reset (true 2-edge FF)",
-        "    wire spi_arst = cs_n | ~rst_n;",
+        "    // Frame arming: set by the cs_n falling edge that starts a frame,",
+        "    // cleared by rst_n. If rst_n is asserted while cs_n is low, the rest",
+        "    // of that frame stays in reset instead of being re-parsed from an",
+        "    // arbitrary bit as a new command. cs_n is a clock for this one flop.",
+        "    reg                 armed;",
+        "",
+        "    always @(negedge cs_n or negedge rst_n) begin",
+        "        if (!rst_n) armed <= 1'b0;",
+        "        else        armed <= 1'b1;",
+        "    end",
+        "",
+        "    // Combined async reset: cs_n deasserted, system reset, or frame not",
+        "    // armed (true 2-edge FF). Deasserts glitch-free at a cs_n falling",
+        "    // edge: cs_n drops first, ~armed follows one clock-to-q later.",
+        "    wire spi_arst = cs_n | ~rst_n | ~armed;",
         "",
     ]
 
@@ -553,7 +635,24 @@ def _emit_read_mux(registers: list) -> list:
     return lines
 
 
-def _emit_receive_block(last_addr: int) -> list:
+def _emit_receive_block(last_addr: int, rx_w: int) -> list:
+    if last_addr == 0:
+        # Single-register map: every data byte after the first saturates.
+        # (A ">= 0" comparison would be constant and trip lint.)
+        addr_step = [
+            "                else",
+            "                    addr_sat <= 1'b1;          // single-register map",
+        ]
+    else:
+        addr_step = [
+            f"                else if (addr >= 7'h{last_addr:02x})",
+            "                    addr_sat <= 1'b1;          // at or past the last register;",
+            "                                               // >= (not ==) so a burst starting",
+            "                                               // above the map cannot step over",
+            "                                               // the check and wrap to 0x00",
+            "                else",
+            "                    addr <= addr + 7'd1;",
+        ]
     return [
         "    //====================================================================",
         "    // SPI Receive Block (Mode 0: sample MOSI on rising SCLK)",
@@ -562,7 +661,7 @@ def _emit_receive_block(last_addr: int) -> list:
         "",
         "    always @(posedge sclk or posedge spi_arst) begin",
         "        if (spi_arst) begin",
-        "            rx_shift <= 7'd0;",
+        f"            rx_shift <= {rx_w - 1}'d0;",
         "            bit_idx  <= 3'd0;",
         "            cmd_done <= 1'b0;",
         "            rw_bit   <= 1'b0;",
@@ -578,16 +677,10 @@ def _emit_receive_block(last_addr: int) -> list:
         "                cmd_done <= 1'b1;",
         "                if (!cmd_done)",
         "                    addr <= rx_next[6:0];     // end of command byte",
-        f"                else if (addr >= 7'h{last_addr:02x})",
-        "                    addr_sat <= 1'b1;          // at or past the last register;",
-        "                                               // >= (not ==) so a burst starting",
-        "                                               // above the map cannot step over",
-        "                                               // the check and wrap to 0x00",
-        "                else",
-        "                    addr <= addr + 7'd1;",
+    ] + addr_step + [
         "            end",
         "",
-        "            rx_shift <= rx_next[6:0];",
+        f"            rx_shift <= rx_next[{rx_w - 2}:0];",
         "            bit_idx  <= bit_idx + 3'd1;",
         "        end",
         "    end",
@@ -704,15 +797,17 @@ def _emit_output_assignments(rw_fields: list) -> list:
 # Top-level Verilog generation
 # =============================================================================
 
-def generate_verilog(registers: list, output_file: str) -> None:
+def generate_verilog(registers: list, output_file: str, source: str) -> None:
     """
     Generate synthesizable SPI register interface.
 
     Synthesizability strategy:
       - Combined async reset: spi_arst = cs_n | ~rst_n (single gate).
         All blocks needing both resets use this one signal → true 2-edge FF.
+      - Arm flop:       clock=negedge cs_n, async-reset=negedge rst_n.
       - Receive block:  clock=posedge sclk, async-reset=posedge spi_arst.
-                        Resets on CS deassert (end of transaction) or system reset.
+                        Resets on CS deassert (end of transaction), system reset,
+                        or while the frame is not armed.
       - Write block:    clock=posedge sclk, async-reset=negedge rst_n only.
                         CS gated by level (!cs_n) in body. Standard 2-edge FF.
       - TX block:       clock=negedge sclk, async-reset=posedge spi_arst.
@@ -735,13 +830,11 @@ def generate_verilog(registers: list, output_file: str) -> None:
     ro_fields = [f for reg in registers for f in reg["fields"] if f["type"] == "ro"]
     rw_fields = [f for reg in registers for f in reg["fields"] if f["type"] == "rw"]
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     sections = [
         # File header
         [
             "// Auto-generated SPI Register Interface",
-            f"// Generated by spireg.py on {timestamp}",
+            f"// Generated by spireg.py from {source}",
             "// Verilog-2005 compatible, synthesizable (single clock + single async per block)",
             "//",
             "// Protocol: Variable-length transfers",
@@ -753,8 +846,11 @@ def generate_verilog(registers: list, output_file: str) -> None:
             "//",
             "// Reset / CS strategy:",
             "//   rst_n    : async system reset, resets everything",
-            "//   spi_arst : combined async reset (cs_n | ~rst_n), used by receive and TX",
-            "//              blocks as a single async-reset edge (true 2-edge FF)",
+            "//   armed    : set by cs_n falling, cleared by rst_n; a frame interrupted",
+            "//              by rst_n is ignored until cs_n deasserts and reasserts",
+            "//   spi_arst : combined async reset (cs_n | ~rst_n | ~armed), used by",
+            "//              receive and TX blocks as a single async-reset edge",
+            "//   CS framing is mandatory (cs_n tied low is not supported)",
             "//   cs_n     : Write block uses cs_n as level gate only (not in sensitivity list)",
             "//",
             "// MISO: core drives MISO at all times; pad-ring should tri-state when cs_n=1",
@@ -764,8 +860,8 @@ def generate_verilog(registers: list, output_file: str) -> None:
         _emit_module_header(ro_fields, rw_fields),
         _emit_declarations(registers, ro_fields),
         _emit_read_mux(registers),
-        _emit_receive_block(registers[-1]["addr"]),
-        _emit_write_block(registers),
+        _emit_receive_block(registers[-1]["addr"], _rx_width(registers)),
+        _emit_write_block(registers) if rw_fields else [],
         _emit_tx_block(),
         _emit_output_assignments(rw_fields),
     ]
@@ -800,10 +896,14 @@ def main():
         print(f"Error: '{csv_file}' not found", file=sys.stderr)
         sys.exit(1)
 
+    # Input/IO problems get a one-line message; anything else is a generator
+    # bug and is allowed to crash with a full traceback.
     try:
         registers = parse_csv(csv_file)
-        generate_verilog(registers, output_file)
-    except Exception as e:
+        digest = hashlib.sha256(Path(csv_file).read_bytes()).hexdigest()[:16]
+        source = f"{Path(csv_file).name} (sha256 {digest}...)"
+        generate_verilog(registers, output_file, source)
+    except (ValueError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

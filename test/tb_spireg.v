@@ -290,6 +290,21 @@ module tb_spireg;
         end
     endtask
 
+    // Send one byte inside an already-open frame (cs_n low), capture MISO.
+    task spi_byte;
+        input  [7:0] b;
+        output [7:0] r;
+        integer j;
+        reg     s;
+        begin
+            for (j = 7; j >= 0; j = j - 1) begin
+                mosi = b[j];
+                sclk_pulse(s);
+                r[j] = s;
+            end
+        end
+    endtask
+
     // Transfer aborted after exactly nbits clocks (counted from the RW bit).
     task spi_abort;
         input        rw;
@@ -401,7 +416,8 @@ module tb_spireg;
             $dumpfile("tb_spireg.vcd");
             $dumpvars(0, tb_spireg);
         end
-        if (!$value$plusargs("seed=%d", seed)) seed = 32'h1234_5678;
+        // %h accepts both "0x1234abcd" and "1234abcd" (iverilog)
+        if (!$value$plusargs("seed=%h", seed)) seed = 32'h1234_5678;
 
         error_count = 0;
         check_count = 0;
@@ -539,22 +555,67 @@ module tb_spireg;
         check_readback("T14");
 
         //--------------------------------------------------------------
-        banner("T15 async reset mid-transaction");
+        banner("T15 async reset mid-transaction (cs_n held low)");
+        // rst_n is released between the rising edges of bits 9 and 10 of the
+        // frame (release time chosen so it never coincides with an SCLK edge).
+        // 0xA0 is chosen so that a slave which re-parses the remaining bits
+        // as a new frame would decode them as "write 0x82 to 0x02" -- i.e.
+        // this test fails unless the rest of the interrupted frame is ignored.
         fork
             begin
-                for (k = 0; k < 8; k = k + 1) txb[k] = 8'hFA;
+                for (k = 0; k < 8; k = k + 1) txb[k] = 8'hA0;
                 spi_xfer(1'b1, A_CONTROL, 8);
             end
             begin
                 #(20*SCLK_HALF);
                 rst_n = 1'b0;
-                #(3*SCLK_HALF);
+                #(2*SCLK_HALF);
                 rst_n = 1'b1;
             end
         join
         model_reset;
         check_outputs("T15 after reset");
         check_readback("T15");
+
+        //--------------------------------------------------------------
+        banner("T15b reset between bytes, cs_n held low: rest of frame ignored");
+        // Master intends: burst write CONTROL=0x82, STATUS=0x42. A reset
+        // after the command byte must not let the slave re-parse 0x82 as a
+        // new command byte (= write 0x42 to DATA_IN).
+        cs_n = 1'b0;
+        #T_CSS;
+        spi_byte(8'h80, tmp);                    // write @ CONTROL
+        rst_n = 1'b0;
+        #(2*SCLK_HALF);
+        rst_n = 1'b1;
+        #(2*SCLK_HALF);
+        spi_byte(8'h82, tmp);
+        spi_byte(8'h42, tmp);
+        #SCLK_HALF;
+        cs_n = 1'b1;
+        #T_CSS;
+        model_reset;
+        check_outputs("T15b write frame");
+
+        // Same for a read frame: after the reset MISO must stay low and the
+        // remaining bits must not be executed, even if they look like a write.
+        cs_n = 1'b0;
+        #T_CSS;
+        spi_byte({1'b0, A_ID}, tmp);             // read @ ID
+        rst_n = 1'b0;
+        #(2*SCLK_HALF);
+        rst_n = 1'b1;
+        #(2*SCLK_HALF);
+        spi_byte(8'h82, tmp);
+        chk("T15b read frame byte 1", tmp, 8'h00);
+        spi_byte(8'h5A, tmp);
+        chk("T15b read frame byte 2", tmp, 8'h00);
+        #SCLK_HALF;
+        cs_n = 1'b1;
+        #T_CSS;
+        model_reset;
+        check_outputs("T15b read frame");
+        check_readback("T15b");               // next frame works normally
 
         //--------------------------------------------------------------
         banner("T16 RO inputs change between transactions and are observed");
