@@ -2,3 +2,5 @@ test/*.vcd
 test/*.out
 test/*generated*.v
 
+test/spi_reg_interface.v
+test/*.log
